@@ -323,3 +323,119 @@ fn test_volfs_forget_removes_immediately() {
     sb.fs.forget(sb.ctx(), q.inode, 1);
     assert!(sb.fs.inodes.read().unwrap().get(&q.inode).is_none());
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: rename, unlink, rmdir keep aliases correct
+//--------------------------------------------------------------------------------------------------
+
+/// After a guest rename the inode reopens through its new name.
+#[test]
+fn test_anchor_rename_then_read() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("old.txt", b"same");
+    let f = sb.lookup_root("old.txt").unwrap();
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("old.txt"),
+            ROOT_INODE,
+            &TestSandbox::cstr("new.txt"),
+            0,
+        )
+        .unwrap();
+    let h = sb.fuse_open(f.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(&sb.fuse_read(f.inode, h, 8, 0).unwrap()[..], b"same");
+    let inodes = sb.fs.inodes.read().unwrap();
+    let data = inodes.get(&f.inode).unwrap();
+    assert_eq!(&*data.anchor_name.read().unwrap(), b"new.txt");
+}
+
+/// Renaming a directory moves every descendant's resolution path.
+#[test]
+fn test_anchor_rename_directory_moves_children() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("dir1");
+    sb.host_create_file("dir1/inner", b"in");
+    let d = sb.lookup_root("dir1").unwrap();
+    let inner = sb.lookup(d.inode, "inner").unwrap();
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("dir1"),
+            ROOT_INODE,
+            &TestSandbox::cstr("dir2"),
+            0,
+        )
+        .unwrap();
+    let h = sb.fuse_open(inner.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(&sb.fuse_read(inner.inode, h, 8, 0).unwrap()[..], b"in");
+}
+
+/// Rename over an existing target detaches the target; an open handle on the
+/// old target still reads its data.
+#[test]
+fn test_anchor_rename_replaces_target() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("src", b"source");
+    sb.host_create_file("dst", b"target");
+    let src = sb.lookup_root("src").unwrap();
+    let dst = sb.lookup_root("dst").unwrap();
+    let dst_h = sb.fuse_open(dst.inode, libc::O_RDONLY as u32).unwrap();
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("src"),
+            ROOT_INODE,
+            &TestSandbox::cstr("dst"),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        &sb.fuse_read(dst.inode, dst_h, 8, 0).unwrap()[..],
+        b"target"
+    );
+    let src_h = sb.fuse_open(src.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(
+        &sb.fuse_read(src.inode, src_h, 8, 0).unwrap()[..],
+        b"source"
+    );
+}
+
+/// Unlink drops the alias; a pre-existing open handle still reads.
+#[test]
+fn test_anchor_unlink_keeps_open_handle() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("gone", b"kept");
+    let g = sb.lookup_root("gone").unwrap();
+    let h = sb.fuse_open(g.inode, libc::O_RDONLY as u32).unwrap();
+    sb.fs
+        .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("gone"))
+        .unwrap();
+    assert_eq!(&sb.fuse_read(g.inode, h, 8, 0).unwrap()[..], b"kept");
+    let inodes = sb.fs.inodes.read().unwrap();
+    let data = inodes.get(&g.inode).unwrap();
+    assert!(data.aliases.read().unwrap().is_empty());
+    assert!(data.unlinked_fd.load(std::sync::atomic::Ordering::Acquire) >= 0);
+}
+
+/// rmdir removes the directory's alias.
+#[test]
+fn test_anchor_rmdir_drops_alias() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("empty");
+    let e = sb.lookup_root("empty").unwrap();
+    sb.fs
+        .rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("empty"))
+        .unwrap();
+    let inodes = sb.fs.inodes.read().unwrap();
+    let data = inodes.get(&e.inode).unwrap();
+    assert!(data.aliases.read().unwrap().is_empty());
+    assert_eq!(
+        data.anchor_parent
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}

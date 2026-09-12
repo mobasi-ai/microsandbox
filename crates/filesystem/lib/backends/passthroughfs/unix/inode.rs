@@ -1151,7 +1151,6 @@ pub(crate) fn register_alias_locked(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn remove_alias_locked(
     inodes: &mut MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>,
     data: &Arc<InodeData>,
