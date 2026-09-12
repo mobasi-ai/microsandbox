@@ -373,9 +373,7 @@ fn open_anchor_reopen_macos(fs: &PassthroughFs, inode: u64) -> io::Result<RawFd>
 /// fd on the inode itself: readlink, symlink times, symlink-fd opens, and hard
 /// link sources. The name is verified to still refer to the tracked identity.
 ///
-/// Unused until a later change wires it into those operations.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 pub(crate) fn anchor_parent_and_name_macos(
     fs: &PassthroughFs,
     inode: u64,

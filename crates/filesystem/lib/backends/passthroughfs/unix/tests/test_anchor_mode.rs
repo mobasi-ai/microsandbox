@@ -478,3 +478,58 @@ fn test_anchor_exchange_same_inode_keeps_both_aliases() {
         b"linked"
     );
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: link, readlink, symlink metadata
+//--------------------------------------------------------------------------------------------------
+
+/// Hard link creation resolves the source through its anchor.
+#[test]
+fn test_anchor_hard_link() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("lnk");
+    sb.host_create_file("lnk/orig", b"linked");
+    let d = sb.lookup_root("lnk").unwrap();
+    let orig = sb.lookup(d.inode, "orig").unwrap();
+    let copy = sb
+        .fs
+        .link(sb.ctx(), orig.inode, ROOT_INODE, &TestSandbox::cstr("copy"))
+        .unwrap();
+    assert_eq!(copy.inode, orig.inode);
+    let h = sb.fuse_open(copy.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(&sb.fuse_read(copy.inode, h, 8, 0).unwrap()[..], b"linked");
+    assert_eq!(std::fs::read(sb.root.join("copy")).unwrap(), b"linked");
+}
+
+/// readlink on a nested symlink works through the anchor parent.
+#[test]
+fn test_anchor_readlink_nested() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("s");
+    std::os::unix::fs::symlink("target-name", sb.root.join("s/link")).unwrap();
+    let s = sb.lookup_root("s").unwrap();
+    let l = sb.lookup(s.inode, "link").unwrap();
+    assert_eq!(sb.fs.readlink(sb.ctx(), l.inode).unwrap(), b"target-name");
+}
+
+/// setattr times on a symlink go through the anchor parent.
+#[test]
+fn test_anchor_symlink_times() {
+    let sb = TestSandbox::with_anchor_mode();
+    std::os::unix::fs::symlink("elsewhere", sb.root.join("tl")).unwrap();
+    let l = sb.lookup_root("tl").unwrap();
+    let mut attr: stat64 = unsafe { std::mem::zeroed() };
+    attr.st_mtime = 1_000_000_000;
+    attr.st_atime = 1_000_000_000;
+    let (st, _) = sb
+        .fs
+        .setattr(
+            sb.ctx(),
+            l.inode,
+            attr,
+            None,
+            SetattrValid::MTIME | SetattrValid::ATIME,
+        )
+        .unwrap();
+    assert_eq!(st.st_mtime, 1_000_000_000);
+}

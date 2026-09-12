@@ -338,14 +338,25 @@ fn clone_handle_file(fs: &PassthroughFs, handle: u64) -> io::Result<File> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn open_symlink_inode_fd_macos(fs: &PassthroughFs, ino: u64) -> io::Result<i32> {
-    let inodes = fs.inodes.read().unwrap();
-    let data = inodes.get(&ino).ok_or_else(platform::ebadf)?;
-    let path = inode::vol_path(data.dev, data.ino);
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_SYMLINK,
-        )
+    let fd = if fs.anchor_mode() {
+        let (dir, name) = inode::anchor_parent_and_name_macos(fs, ino)?;
+        unsafe {
+            libc::openat(
+                dir.raw(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_SYMLINK,
+            )
+        }
+    } else {
+        let inodes = fs.inodes.read().unwrap();
+        let data = inodes.get(&ino).ok_or_else(platform::ebadf)?;
+        let path = inode::vol_path(data.dev, data.ino);
+        unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_SYMLINK,
+            )
+        }
     };
     if fd < 0 {
         return Err(platform::linux_error(io::Error::last_os_error()));
@@ -360,16 +371,28 @@ fn set_symlink_times_macos(
     ino: u64,
     times: &[libc::timespec; 2],
 ) -> io::Result<()> {
-    let inodes = fs.inodes.read().unwrap();
-    let data = inodes.get(&ino).ok_or_else(platform::ebadf)?;
-    let path = inode::vol_path(data.dev, data.ino);
-    let ret = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
+    let ret = if fs.anchor_mode() {
+        let (dir, name) = inode::anchor_parent_and_name_macos(fs, ino)?;
+        unsafe {
+            libc::utimensat(
+                dir.raw(),
+                name.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        }
+    } else {
+        let inodes = fs.inodes.read().unwrap();
+        let data = inodes.get(&ino).ok_or_else(platform::ebadf)?;
+        let path = inode::vol_path(data.dev, data.ino);
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        }
     };
     if ret < 0 {
         return Err(platform::linux_error(io::Error::last_os_error()));
