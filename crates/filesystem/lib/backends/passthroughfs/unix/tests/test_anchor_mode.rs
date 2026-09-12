@@ -439,3 +439,42 @@ fn test_anchor_rmdir_drops_alias() {
         0
     );
 }
+
+/// Exchanging two names that are hard-linked to the same inode must leave
+/// both aliases intact: nothing actually moves on disk.
+#[test]
+fn test_anchor_exchange_same_inode_keeps_both_aliases() {
+    let sb = TestSandbox::with_anchor_mode();
+    let a = sb.host_create_file("a", b"linked");
+    std::fs::hard_link(&a, sb.root.join("b")).unwrap();
+    let entry_a = sb.lookup_root("a").unwrap();
+    let entry_b = sb.lookup_root("b").unwrap();
+    assert_eq!(entry_a.inode, entry_b.inode);
+
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("a"),
+            ROOT_INODE,
+            &TestSandbox::cstr("b"),
+            2, // RENAME_EXCHANGE
+        )
+        .unwrap();
+
+    let inodes = sb.fs.inodes.read().unwrap();
+    let data = inodes.get(&entry_a.inode).unwrap();
+    assert_eq!(data.aliases.read().unwrap().len(), 2);
+    drop(inodes);
+
+    let h_a = sb.fuse_open(entry_a.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(
+        &sb.fuse_read(entry_a.inode, h_a, 8, 0).unwrap()[..],
+        b"linked"
+    );
+    let h_b = sb.fuse_open(entry_b.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(
+        &sb.fuse_read(entry_b.inode, h_b, 8, 0).unwrap()[..],
+        b"linked"
+    );
+}

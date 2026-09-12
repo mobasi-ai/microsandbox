@@ -395,6 +395,8 @@ pub(crate) fn do_rename(
             None
         };
         // Keep the replaced target readable through open handles, as unlink does.
+        // O_NONBLOCK guards against a target that is a FIFO: without it, an
+        // open on a FIFO with no writer would block the FUSE worker.
         let target_probe = if anchor_mode {
             match platform::fstatat_nofollow(new_fd.raw(), newname) {
                 Ok(st) => {
@@ -406,12 +408,13 @@ pub(crate) fn do_rename(
                         libc::openat(
                             new_fd.raw(),
                             newname.as_ptr(),
-                            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
                         )
                     };
                     Some((if fd >= 0 { Some(fd) } else { None }, key))
                 }
-                Err(_) => None,
+                Err(err) if err.raw_os_error() == Some(libc::ENOENT) => None,
+                Err(err) => return Err(err),
             }
         } else {
             None
@@ -470,6 +473,15 @@ pub(crate) fn do_rename(
             let source_data = inodes.get_alt(&source_key).cloned();
 
             if flags & RENAME_EXCHANGE != 0 {
+                if let Some((fd, target_key)) = target_probe.as_ref()
+                    && *target_key == source_key
+                {
+                    if let Some(fd) = fd {
+                        unsafe { libc::close(*fd) };
+                    }
+                    return Ok(());
+                }
+
                 if let Some(source) = source_data.as_ref() {
                     let _ = inode::remove_alias_locked(&mut inodes, source, &old_alias);
                     inode::register_alias_locked(&mut inodes, source, new_alias.clone());
