@@ -372,7 +372,6 @@ fn open_anchor_reopen_macos(fs: &PassthroughFs, inode: u64) -> io::Result<RawFd>
 /// Used by operations that need a `(dirfd, name)` pair on macOS instead of an
 /// fd on the inode itself: readlink, symlink times, symlink-fd opens, and hard
 /// link sources. The name is verified to still refer to the tracked identity.
-///
 #[cfg(target_os = "macos")]
 pub(crate) fn anchor_parent_and_name_macos(
     fs: &PassthroughFs,

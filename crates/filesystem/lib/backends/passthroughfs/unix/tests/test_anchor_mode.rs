@@ -512,7 +512,9 @@ fn test_anchor_readlink_nested() {
     assert_eq!(sb.fs.readlink(sb.ctx(), l.inode).unwrap(), b"target-name");
 }
 
-/// setattr times on a symlink go through the anchor parent.
+/// setattr times on a symlink go through the anchor parent, and both atime
+/// and mtime land on the verified fd via `futimens` rather than a name-based
+/// `utimensat`.
 #[test]
 fn test_anchor_symlink_times() {
     let sb = TestSandbox::with_anchor_mode();
@@ -520,7 +522,7 @@ fn test_anchor_symlink_times() {
     let l = sb.lookup_root("tl").unwrap();
     let mut attr: stat64 = unsafe { std::mem::zeroed() };
     attr.st_mtime = 1_000_000_000;
-    attr.st_atime = 1_000_000_000;
+    attr.st_atime = 2_000_000_000;
     let (st, _) = sb
         .fs
         .setattr(
@@ -532,4 +534,28 @@ fn test_anchor_symlink_times() {
         )
         .unwrap();
     assert_eq!(st.st_mtime, 1_000_000_000);
+    assert_eq!(st.st_atime, 2_000_000_000);
+}
+
+/// A host-side replacement of a symlink's name with a regular file must not
+/// let a stale fd operate on the replacement: the anchor-mode fd open
+/// verifies (dev, ino) after opening and fails closed as `ENOENT`.
+#[test]
+fn test_anchor_symlink_fd_identity_mismatch() {
+    let sb = TestSandbox::with_anchor_mode();
+    std::os::unix::fs::symlink("elsewhere", sb.root.join("sl")).unwrap();
+    let l = sb.lookup_root("sl").unwrap();
+
+    // Simulate a host-side race: remove the symlink and put a regular file
+    // under the same name, so the tracked inode's anchor now names a
+    // different on-disk identity.
+    std::fs::remove_file(sb.root.join("sl")).unwrap();
+    std::fs::write(sb.root.join("sl"), b"not a symlink").unwrap();
+
+    let mut attr: stat64 = unsafe { std::mem::zeroed() };
+    attr.st_mode = libc::S_IFLNK | 0o777;
+    let result = sb
+        .fs
+        .setattr(sb.ctx(), l.inode, attr, None, SetattrValid::MODE);
+    TestSandbox::assert_errno(result, LINUX_ENOENT);
 }
