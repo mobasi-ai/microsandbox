@@ -229,6 +229,7 @@ pub struct PassthroughFs {
     /// anchor walk from `root_fd` instead of by identity path.
     ///
     /// Read by `anchor_mode`, which gates the anchor-walk reopen fallback.
+    /// Atomic so tests can force the fallback on a volfs-capable host.
     #[cfg(target_os = "macos")]
     pub(crate) volfs_supported: AtomicBool,
 
