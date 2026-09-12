@@ -5,6 +5,7 @@ mod test_config;
 mod test_corrupt_xattr;
 mod test_create_ops;
 mod test_dir_ops;
+mod test_exfat_fixture;
 mod test_file_ops;
 mod test_flag_translation;
 mod test_host_permissions;
