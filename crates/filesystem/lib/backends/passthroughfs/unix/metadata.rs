@@ -223,7 +223,7 @@ pub(crate) fn do_setattr(
 
         #[cfg(target_os = "macos")]
         if guest_file_type == platform::MODE_LNK {
-            set_symlink_times_macos(fs, ino, &times)?;
+            set_symlink_times_macos(fs, ino, fd, &times)?;
         } else {
             let ret = unsafe { libc::futimens(fd, times.as_ptr()) };
             if ret < 0 {
@@ -402,22 +402,24 @@ pub(crate) fn open_symlink_inode_fd_macos(fs: &PassthroughFs, ino: u64) -> io::R
     Ok(fd)
 }
 
+/// Apply symlink timestamps on macOS.
+///
+/// In anchor mode `fd` is used directly: `do_setattr` already opened the
+/// symlink through `open_symlink_inode_fd_macos`, which verified the fd's
+/// identity, so `futimens` on it is bound to the tracked inode instead of the
+/// name a `utimensat` would trust — and the anchor walk runs once instead of
+/// twice. Volfs mode keeps the identity-path `utimensat`.
 #[cfg(target_os = "macos")]
 fn set_symlink_times_macos(
     fs: &PassthroughFs,
     ino: u64,
+    fd: i32,
     times: &[libc::timespec; 2],
 ) -> io::Result<()> {
     if fs.anchor_mode() {
-        // `open_symlink_inode_fd_macos` already verifies the fd's identity,
-        // so `futimens` on it is bound to the tracked inode instead of the
-        // name a name-based `utimensat` would trust.
-        let fd = open_symlink_inode_fd_macos(fs, ino)?;
         let ret = unsafe { libc::futimens(fd, times.as_ptr()) };
-        let err = (ret < 0).then(io::Error::last_os_error);
-        unsafe { libc::close(fd) };
-        if let Some(err) = err {
-            return Err(platform::linux_error(err));
+        if ret < 0 {
+            return Err(platform::linux_error(io::Error::last_os_error()));
         }
         return Ok(());
     }
