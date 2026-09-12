@@ -140,11 +140,45 @@ fn test_anchor_identity_mismatch_fails_closed() {
     let sb = TestSandbox::with_anchor_mode();
     sb.host_create_file("victim.txt", b"secret");
     let v = sb.lookup_root("victim.txt").unwrap();
-    // Replace the directory entry with a different inode.
-    std::fs::remove_file(sb.root.join("victim.txt")).unwrap();
+    // Move the original aside instead of deleting it, so its inode number
+    // stays live and APFS cannot coincidentally reuse it for the
+    // replacement (which would mask the identity check succeeding for the
+    // wrong reason).
+    std::fs::rename(sb.root.join("victim.txt"), sb.root.join("victim.orig")).unwrap();
     sb.host_create_file("victim.txt", b"impostor");
+
     let result = sb.fuse_open(v.inode, libc::O_RDONLY as u32);
     TestSandbox::assert_errno(result, LINUX_ENOENT);
+
+    // Only the stale inode handle is refused; a fresh lookup of the name
+    // sees the impostor normally.
+    let fresh = sb.lookup_root("victim.txt").unwrap();
+    let h = sb.fuse_open(fresh.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(
+        &sb.fuse_read(fresh.inode, h, 64, 0).unwrap()[..],
+        b"impostor"
+    );
+}
+
+/// A destructive reopen (`O_TRUNC`) must not touch the impostor before the
+/// identity check rejects the stale inode: truncation happens only after
+/// `validate_identity_macos` passes, never as a side effect of the walk's
+/// final `openat`.
+#[test]
+fn test_anchor_reopen_truncate_does_not_touch_impostor() {
+    const LINUX_O_WRONLY: u32 = 1;
+
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("victim.txt", b"secret");
+    let v = sb.lookup_root("victim.txt").unwrap();
+    std::fs::rename(sb.root.join("victim.txt"), sb.root.join("victim.moved")).unwrap();
+    sb.host_create_file("victim.txt", b"impostor");
+
+    let result = sb.fuse_open(v.inode, LINUX_O_WRONLY | LINUX_O_TRUNC);
+    TestSandbox::assert_errno(result, LINUX_ENOENT);
+
+    let contents = std::fs::read(sb.root.join("victim.txt")).unwrap();
+    assert_eq!(contents, b"impostor");
 }
 
 /// A host-side symlink component in the anchor path is refused.
@@ -160,4 +194,67 @@ fn test_anchor_refuses_symlink_component() {
     std::os::unix::fs::symlink(sb.root.join("moved"), sb.root.join("real")).unwrap();
     let result = sb.fuse_open(f.inode, libc::O_RDONLY as u32);
     TestSandbox::assert_errno(result, LINUX_ENOENT);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: root inode
+//--------------------------------------------------------------------------------------------------
+
+/// The root inode has no anchor alias (it is inode 1 by FUSE convention, not
+/// a recorded (parent, name) pair), so `getattr` on it must resolve via the
+/// root-inode shortcut in `open_anchor_fd_macos` rather than the (empty)
+/// alias loop.
+#[test]
+fn test_anchor_root_getattr() {
+    let sb = TestSandbox::with_anchor_mode();
+    let (st, _) = sb.fs.getattr(sb.ctx(), ROOT_INODE, None).unwrap();
+    assert_eq!(
+        st.st_mode as u32 & libc::S_IFMT as u32,
+        libc::S_IFDIR as u32
+    );
+}
+
+/// `opendir` + `readdir` on the root inode must also resolve via the
+/// root-inode shortcut.
+#[test]
+fn test_anchor_root_readdir() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("marker.txt", b"x");
+    let h = sb.fuse_opendir(ROOT_INODE).unwrap();
+    let entries = sb.fs.readdir(sb.ctx(), ROOT_INODE, h, 4096, 0).unwrap();
+    let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.to_vec()).collect();
+    assert!(names.contains(&b"marker.txt".to_vec()));
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: symlinks
+//--------------------------------------------------------------------------------------------------
+
+/// A tracked symlink inode can still be stat'ed in anchor mode: the final
+/// component's `ELOOP` from `O_NOFOLLOW` triggers the `O_SYMLINK` retry
+/// instead of being classified as a stale alias.
+#[test]
+fn test_anchor_getattr_symlink() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("target.txt", b"x");
+    std::os::unix::fs::symlink(sb.root.join("target.txt"), sb.root.join("link")).unwrap();
+    let link = sb.lookup_root("link").unwrap();
+    let (st, _) = sb.fs.getattr(sb.ctx(), link.inode, None).unwrap();
+    assert_eq!(
+        st.st_mode as u32 & libc::S_IFMT as u32,
+        libc::S_IFLNK as u32
+    );
+}
+
+/// Opening a tracked symlink inode for I/O must still fail closed with
+/// `ELOOP`, exactly as a real symlink would on Linux — the anchor walk must
+/// not follow it just because reopening it for stat succeeds.
+#[test]
+fn test_anchor_open_symlink_for_io_is_eloop() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("target.txt", b"x");
+    std::os::unix::fs::symlink(sb.root.join("target.txt"), sb.root.join("link")).unwrap();
+    let link = sb.lookup_root("link").unwrap();
+    let result = sb.fuse_open(link.inode, libc::O_RDONLY as u32);
+    TestSandbox::assert_errno(result, LINUX_ELOOP);
 }
