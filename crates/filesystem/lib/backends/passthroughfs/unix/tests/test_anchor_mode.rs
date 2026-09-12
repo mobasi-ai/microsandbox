@@ -285,3 +285,41 @@ fn test_anchor_exclusive_create() {
     let second = sb.fuse_create_flags(ROOT_INODE, "excl.txt", 0o644, false, flags);
     TestSandbox::assert_errno(second, LINUX_EEXIST);
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: forget keeps anchors alive
+//--------------------------------------------------------------------------------------------------
+
+/// Forgetting a directory that still anchors a child must keep the directory
+/// record so the child can be reopened.
+#[test]
+fn test_anchor_parent_survives_forget_while_child_lives() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("p");
+    sb.host_create_file("p/child", b"c");
+    let p = sb.lookup_root("p").unwrap();
+    let child = sb.lookup(p.inode, "child").unwrap();
+
+    sb.fs.forget(sb.ctx(), p.inode, 1);
+    assert!(sb.fs.inodes.read().unwrap().get(&p.inode).is_some());
+
+    let h = sb.fuse_open(child.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(&sb.fuse_read(child.inode, h, 8, 0).unwrap()[..], b"c");
+
+    // Forgetting the child releases the parent too.
+    sb.fs.forget(sb.ctx(), child.inode, 1);
+    assert!(sb.fs.inodes.read().unwrap().get(&child.inode).is_none());
+    assert!(sb.fs.inodes.read().unwrap().get(&p.inode).is_none());
+}
+
+/// In volfs mode forget removes the inode immediately, as before.
+#[test]
+fn test_volfs_forget_removes_immediately() {
+    let sb = TestSandbox::new();
+    sb.host_create_dir("q");
+    sb.host_create_file("q/child", b"c");
+    let q = sb.lookup_root("q").unwrap();
+    let _child = sb.lookup(q.inode, "child").unwrap();
+    sb.fs.forget(sb.ctx(), q.inode, 1);
+    assert!(sb.fs.inodes.read().unwrap().get(&q.inode).is_none());
+}
