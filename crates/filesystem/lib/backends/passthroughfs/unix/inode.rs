@@ -1285,17 +1285,12 @@ fn maybe_remove_inode_locked(
     }
 
     let anchor_parent = data.anchor_parent.load(Ordering::Acquire);
-    if let Some(removed) = inodes.remove(&inode) {
+    if let Some(_removed) = inodes.remove(&inode) {
+        // On macOS the retained fd is closed by `Drop for InodeData` when the
+        // last `Arc` goes away, so removal must not close it here as well.
         #[cfg(target_os = "linux")]
         {
-            let _ = removed.retained_fd.lock().unwrap().take();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let ufd = removed.unlinked_fd.load(Ordering::Acquire);
-            if ufd >= 0 {
-                unsafe { libc::close(ufd as i32) };
-            }
+            let _ = _removed.retained_fd.lock().unwrap().take();
         }
     }
 
