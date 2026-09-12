@@ -223,6 +223,10 @@ pub(crate) fn do_setattr(
 
         #[cfg(target_os = "macos")]
         if guest_file_type == platform::MODE_LNK {
+            // `fd` is the verified O_SYMLINK descriptor opened above. That
+            // holds because a FUSE handle on a symlink cannot exist: opening a
+            // symlink inode for I/O fails ELOOP, so `handle` is None here.
+            debug_assert!(handle.is_none(), "symlink setattr cannot carry a handle");
             set_symlink_times_macos(fs, ino, fd, &times)?;
         } else {
             let ret = unsafe { libc::futimens(fd, times.as_ptr()) };

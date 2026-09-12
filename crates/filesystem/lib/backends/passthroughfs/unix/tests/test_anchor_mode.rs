@@ -849,3 +849,52 @@ fn test_open_symlink_inode_fd_rejects_replacement() {
         LINUX_ENOENT,
     );
 }
+
+/// The fd retained across an unlink must be the file the identity key names.
+///
+/// The key and the fd come from two syscalls, so a host-side replacement can
+/// in principle land between them. That interleaving is not reachable from a
+/// single-threaded test, so this asserts the property from the outside: after
+/// the name is replaced on the host, the FUSE unlink retains no descriptor for
+/// the tracked inode, the tracked inode refuses to resolve through its stale
+/// name, and a handle opened before the replacement still reads the original
+/// bytes.
+#[test]
+fn test_anchor_unlink_replacement_fd_not_retained() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_file("f", b"original");
+    let file = sb.lookup_root("f").unwrap();
+    let handle = sb.fuse_open(file.inode, libc::O_RDONLY as u32).unwrap();
+
+    // Move the original aside so its inode stays live, then put a different
+    // file under the tracked name.
+    std::fs::rename(sb.root.join("f"), sb.root.join("f.orig")).unwrap();
+    sb.host_create_file("f", b"replacement");
+
+    sb.fs
+        .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("f"))
+        .unwrap();
+    assert!(!sb.root.join("f").exists());
+
+    {
+        let inodes = sb.fs.inodes.read().unwrap();
+        let data = inodes.get(&file.inode).unwrap();
+        assert_eq!(
+            data.unlinked_fd.load(std::sync::atomic::Ordering::Acquire),
+            -1,
+            "the replacement's descriptor must not be retained"
+        );
+    }
+
+    // The stale name is gone, so the tracked inode no longer resolves.
+    TestSandbox::assert_errno(
+        sb.fuse_open(file.inode, libc::O_RDONLY as u32),
+        LINUX_ENOENT,
+    );
+
+    assert_eq!(
+        &sb.fuse_read(file.inode, handle, 16, 0).unwrap()[..],
+        b"original"
+    );
+    assert_eq!(std::fs::read(sb.root.join("f.orig")).unwrap(), b"original");
+}

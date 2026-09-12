@@ -133,19 +133,39 @@ pub(crate) fn do_unlink(
     // pre-unlink open could not obtain an fd for.
     #[cfg(target_os = "macos")]
     if fs.anchor_mode() {
+        // The key and the fd come from two syscalls, so the host can replace
+        // the name between them. A replacement's fd must never be retained as
+        // this inode's data: every later retained-fd read dups or stats it
+        // before any anchor verification runs. Keep it only when it is the
+        // same file the key names; the alias still goes away either way.
+        let verified_fd = match pre_unlink_fd {
+            Some(fd) => match (pre_unlink_key, platform::fstat(fd)) {
+                (Some(key), Ok(st))
+                    if platform::stat_ino(&st) == key.ino && platform::stat_dev(&st) == key.dev =>
+                {
+                    Some(fd)
+                }
+                _ => {
+                    unsafe { libc::close(fd) };
+                    None
+                }
+            },
+            None => None,
+        };
+
         let mut kept_fd = false;
         if let Some(alt_key) = pre_unlink_key {
             let alias = NamespaceAlias::new(parent, name.to_bytes());
             let mut inodes = fs.inodes.write().unwrap();
             if let Some(data) = inodes.get_alt(&alt_key).cloned() {
                 let detached = inode::remove_alias_locked(&mut inodes, &data, &alias);
-                if detached && let Some(fd) = pre_unlink_fd {
+                if detached && let Some(fd) = verified_fd {
                     inode::store_unlinked_fd(&data, fd);
                     kept_fd = true;
                 }
             }
         }
-        if !kept_fd && let Some(fd) = pre_unlink_fd {
+        if !kept_fd && let Some(fd) = verified_fd {
             unsafe { libc::close(fd) };
         }
     } else if let Some(fd) = pre_unlink_fd {
