@@ -1322,15 +1322,22 @@ pub(crate) fn open_inode_fd(fs: &PassthroughFs, inode: u64, flags: i32) -> io::R
         if fs.anchor_mode() {
             drop(inodes);
             // A reopen targets an already-admitted inode by identity, not a
-            // fresh path lookup: O_CREAT/O_EXCL make no sense here, and
+            // fresh path lookup: O_CREAT makes no sense here (do_create
+            // already created the file before this reopen runs), and
             // O_TRUNC must not reach the walk's final openat, or a
             // host-side replacement at the anchored name would be
             // truncated before validate_identity_macos gets a chance to
             // reject it. Truncate only after the identity check passes.
-            if flags & (libc::O_CREAT | libc::O_EXCL) != 0 {
+            // O_EXCL is meaningless without O_CREAT (nothing left to
+            // exclude against) and must NOT be rejected here: do_create's
+            // reopen of a just-created file
+            // (open_inode_fd(fs, entry.inode, open_flags & !O_CREAT)) keeps
+            // O_EXCL set, so rejecting it would break every guest
+            // O_CREAT|O_EXCL create in anchor mode.
+            if flags & libc::O_CREAT != 0 {
                 return Err(platform::einval());
             }
-            let walk_flags = flags & !(libc::O_NOFOLLOW | libc::O_TRUNC);
+            let walk_flags = flags & !(libc::O_NOFOLLOW | libc::O_TRUNC | libc::O_EXCL);
             let fd = open_anchor_fd_macos(fs, inode, walk_flags, false)?;
             if flags & libc::O_TRUNC != 0 && unsafe { libc::ftruncate(fd, 0) } < 0 {
                 let err = io::Error::last_os_error();

@@ -258,3 +258,30 @@ fn test_anchor_open_symlink_for_io_is_eloop() {
     let result = sb.fuse_open(link.inode, libc::O_RDONLY as u32);
     TestSandbox::assert_errno(result, LINUX_ELOOP);
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: exclusive create
+//--------------------------------------------------------------------------------------------------
+
+/// `do_create`'s reopen of a just-created file keeps `O_EXCL` set (it strips
+/// only `O_CREAT`), so `open_inode_fd`'s anchor branch must let `O_EXCL`
+/// through the walk rather than rejecting it: `O_CREAT|O_EXCL` creates must
+/// still succeed in anchor mode, and a second exclusive create of the same
+/// name must still fail `EEXIST`.
+#[test]
+fn test_anchor_exclusive_create() {
+    const LINUX_O_WRONLY: u32 = 1;
+    const LINUX_O_CREAT: u32 = 0x40;
+    const LINUX_O_EXCL: u32 = 0x80;
+
+    let sb = TestSandbox::with_anchor_mode();
+    let flags = LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_EXCL;
+    let (entry, handle) = sb
+        .fuse_create_flags(ROOT_INODE, "excl.txt", 0o644, false, flags)
+        .unwrap();
+    sb.fuse_write(entry.inode, handle, b"hello", 0).unwrap();
+    assert_eq!(std::fs::read(sb.root.join("excl.txt")).unwrap(), b"hello");
+
+    let second = sb.fuse_create_flags(ROOT_INODE, "excl.txt", 0o644, false, flags);
+    TestSandbox::assert_errno(second, LINUX_EEXIST);
+}
