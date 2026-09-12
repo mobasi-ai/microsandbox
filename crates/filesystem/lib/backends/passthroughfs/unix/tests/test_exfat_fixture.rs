@@ -140,3 +140,171 @@ fn test_exfat_volume_read_path() {
     assert_eq!(st2.st_ino, st.st_ino);
     assert_eq!(st2.st_size, 11);
 }
+
+/// Create, write, rename, unlink, rmdir, and link on a real exFAT volume, all
+/// through FUSE operations. The rename assertions are the load-bearing ones:
+/// anchor mode reopens an inode by name and then checks `(st_dev, st_ino)`, so
+/// exFAT must keep an inode number stable while the name moves.
+#[test]
+fn test_exfat_volume_write_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(vol) = ExfatVolume::create(tmp.path()) else {
+        eprintln!("skipping: hdiutil exFAT fixture unavailable");
+        return;
+    };
+
+    let root = vol.mount.join("case");
+    std::fs::create_dir_all(root.join("movable")).unwrap();
+    std::fs::write(root.join("movable/inner.txt"), b"inner").unwrap();
+    std::fs::create_dir_all(root.join("emptydir")).unwrap();
+    std::fs::write(root.join("doomed.txt"), b"doomed").unwrap();
+    std::fs::write(root.join("linkme.txt"), b"linkme").unwrap();
+
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: root.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+    let ctx = Context {
+        uid: 0,
+        gid: 0,
+        pid: 1,
+    };
+    let c = |s: &str| CString::new(s).unwrap();
+    eprintln!("exfat write fixture: anchor_mode={}", fs.anchor_mode());
+
+    // Create and write through FUSE.
+    const LINUX_O_RDWR_FLAGS: u32 = 2;
+    let (created, handle, _) = fs
+        .create(
+            ctx,
+            ROOT_INODE,
+            &c("created.txt"),
+            0o644,
+            false,
+            LINUX_O_RDWR_FLAGS,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+    let handle = handle.unwrap();
+    let mut reader = MockZeroCopyReader::new(b"written-bytes".to_vec());
+    let written = fs
+        .write(
+            ctx,
+            created.inode,
+            handle,
+            &mut reader,
+            13,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+    assert_eq!(written, 13);
+    assert_eq!(
+        std::fs::read(root.join("created.txt")).unwrap(),
+        b"written-bytes"
+    );
+
+    // Rename the file: the host inode number must survive the move, or the
+    // anchor-mode identity check would refuse every later reopen.
+    let (before, _) = fs.getattr(ctx, created.inode, None).unwrap();
+    fs.rename(
+        ctx,
+        ROOT_INODE,
+        &c("created.txt"),
+        ROOT_INODE,
+        &c("renamed.txt"),
+        0,
+    )
+    .unwrap();
+    let (after, _) = fs.getattr(ctx, created.inode, None).unwrap();
+    assert_eq!(after.st_ino, before.st_ino);
+    assert_eq!(after.st_size, 13);
+
+    // Rename a directory and read a file inside it through its old inode.
+    let movable = fs.lookup(ctx, ROOT_INODE, &c("movable")).unwrap();
+    let inner = fs.lookup(ctx, movable.inode, &c("inner.txt")).unwrap();
+    fs.rename(ctx, ROOT_INODE, &c("movable"), ROOT_INODE, &c("moved"), 0)
+        .unwrap();
+    let (inner_handle, _) = fs.open(ctx, inner.inode, false, 0).unwrap();
+    let mut writer = MockZeroCopyWriter::new();
+    let n = fs
+        .read(
+            ctx,
+            inner.inode,
+            inner_handle.unwrap(),
+            &mut writer,
+            32,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+    let mut data = writer.into_data();
+    data.truncate(n);
+    assert_eq!(&data[..], b"inner");
+
+    // Unlink with a handle open: the retained fd keeps the data readable.
+    let doomed = fs.lookup(ctx, ROOT_INODE, &c("doomed.txt")).unwrap();
+    let (doomed_handle, _) = fs.open(ctx, doomed.inode, false, 0).unwrap();
+    fs.unlink(ctx, ROOT_INODE, &c("doomed.txt")).unwrap();
+    assert!(!root.join("doomed.txt").exists());
+    let mut writer = MockZeroCopyWriter::new();
+    let n = fs
+        .read(
+            ctx,
+            doomed.inode,
+            doomed_handle.unwrap(),
+            &mut writer,
+            32,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+    let mut data = writer.into_data();
+    data.truncate(n);
+    assert_eq!(&data[..], b"doomed");
+
+    // rmdir an empty directory.
+    let empty = fs.lookup(ctx, ROOT_INODE, &c("emptydir")).unwrap();
+    fs.rmdir(ctx, ROOT_INODE, &c("emptydir")).unwrap();
+    assert!(!root.join("emptydir").exists());
+    let _ = empty;
+
+    // Hard link. exFAT has no hard links, so an unsupported answer is a pass
+    // as long as it is reported honestly instead of creating a wrong entry.
+    let linkme = fs.lookup(ctx, ROOT_INODE, &c("linkme.txt")).unwrap();
+    match fs.link(ctx, linkme.inode, ROOT_INODE, &c("linked.txt")) {
+        Ok(linked) => {
+            assert_eq!(linked.inode, linkme.inode);
+            let (linked_handle, _) = fs.open(ctx, linked.inode, false, 0).unwrap();
+            let mut writer = MockZeroCopyWriter::new();
+            let n = fs
+                .read(
+                    ctx,
+                    linked.inode,
+                    linked_handle.unwrap(),
+                    &mut writer,
+                    32,
+                    0,
+                    None,
+                    0,
+                )
+                .unwrap();
+            let mut data = writer.into_data();
+            data.truncate(n);
+            assert_eq!(&data[..], b"linkme");
+            assert_eq!(std::fs::read(root.join("linked.txt")).unwrap(), b"linkme");
+        }
+        Err(err) => {
+            eprintln!("exfat write fixture: hard link unsupported ({err})");
+            assert!(!root.join("linked.txt").exists());
+        }
+    }
+}

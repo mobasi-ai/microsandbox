@@ -559,3 +559,293 @@ fn test_anchor_symlink_fd_identity_mismatch() {
         .setattr(sb.ctx(), l.inode, attr, None, SetattrValid::MODE);
     TestSandbox::assert_errno(result, LINUX_ENOENT);
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: root reopen is a fresh file description
+//--------------------------------------------------------------------------------------------------
+
+/// Two root directory handles must not share one file description. A dup of
+/// the retained root fd would share its seek offset, so draining one listing
+/// would truncate the other.
+#[test]
+fn test_anchor_root_opendir_twice_independent() {
+    let sb = TestSandbox::with_anchor_mode();
+    for i in 0..8 {
+        sb.host_create_file(&format!("entry{i}"), b"x");
+    }
+
+    let first = sb.fuse_opendir(ROOT_INODE).unwrap();
+    let second = sb.fuse_opendir(ROOT_INODE).unwrap();
+
+    // Distinct file descriptions: moving one handle's offset must not move
+    // the other's.
+    let (fd_first, fd_second) = {
+        let handles = sb.fs.dir_handles.read().unwrap();
+        let a = handles
+            .get(&first)
+            .unwrap()
+            .file
+            .read()
+            .unwrap()
+            .as_raw_fd();
+        let b = handles
+            .get(&second)
+            .unwrap()
+            .file
+            .read()
+            .unwrap()
+            .as_raw_fd();
+        (a, b)
+    };
+    assert_ne!(fd_first, fd_second);
+    let moved = unsafe { libc::lseek(fd_first, 0, libc::SEEK_END) };
+    assert!(moved > 0);
+    assert_eq!(unsafe { libc::lseek(fd_second, 0, libc::SEEK_CUR) }, 0);
+
+    // Drain the first listing, then list the second from offset 0.
+    let drained = sb.fs.readdir(sb.ctx(), ROOT_INODE, first, 4096, 0).unwrap();
+    assert!(!drained.is_empty());
+    assert!(
+        sb.fs
+            .readdir(sb.ctx(), ROOT_INODE, first, 4096, drained.len() as u64)
+            .unwrap()
+            .is_empty()
+    );
+
+    let names: Vec<Vec<u8>> = sb
+        .fs
+        .readdir(sb.ctx(), ROOT_INODE, second, 4096, 0)
+        .unwrap()
+        .iter()
+        .map(|e| e.name.to_vec())
+        .collect();
+    for i in 0..8 {
+        assert!(names.contains(&format!("entry{i}").into_bytes()));
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: entries that cannot be opened
+//--------------------------------------------------------------------------------------------------
+
+/// A Unix socket cannot be opened, but it must still look up: the anchor-mode
+/// lookup falls back to `fstatat` for any open failure, not just a denied
+/// permission.
+#[test]
+fn test_anchor_lookup_socket_entry() {
+    let sb = TestSandbox::with_anchor_mode();
+    let _listener = std::os::unix::net::UnixListener::bind(sb.root.join("sock")).unwrap();
+    let entry = sb.lookup_root("sock").unwrap();
+    assert_eq!(
+        entry.attr.st_mode as u32 & libc::S_IFMT as u32,
+        libc::S_IFSOCK as u32
+    );
+}
+
+/// A FIFO with no writer must not park the worker: every pre-verification
+/// open in anchor mode carries `O_NONBLOCK`.
+#[test]
+fn test_anchor_getattr_fifo_does_not_block() {
+    let sb = TestSandbox::with_anchor_mode();
+    let path = TestSandbox::cstr(sb.root.join("pipe").to_str().unwrap());
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+
+    let entry = sb.lookup_root("pipe").unwrap();
+    assert_eq!(
+        entry.attr.st_mode as u32 & libc::S_IFMT as u32,
+        libc::S_IFIFO as u32
+    );
+    let (st, _) = sb.fs.getattr(sb.ctx(), entry.inode, None).unwrap();
+    assert_eq!(
+        st.st_mode as u32 & libc::S_IFMT as u32,
+        libc::S_IFIFO as u32
+    );
+}
+
+/// A host-side error on the walk is reported as itself. A denied parent
+/// directory must surface as `EACCES`, never as a phantom `ENOENT`.
+#[test]
+fn test_anchor_reopen_preserves_host_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("locked");
+    sb.host_create_file("locked/file", b"x");
+    let dir = sb.lookup_root("locked").unwrap();
+    let file = sb.lookup(dir.inode, "file").unwrap();
+
+    let dir_path = sb.root.join("locked");
+    std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = sb.fuse_open(file.inode, libc::O_RDONLY as u32);
+    // Restore before asserting: a failed assertion must not leave a mode-000
+    // directory behind for the temp-dir cleanup to trip over.
+    std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    TestSandbox::assert_errno(result, LINUX_EACCES);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: alias bookkeeping edge cases
+//--------------------------------------------------------------------------------------------------
+
+/// A plain rename of one link onto another link of the same inode changes
+/// nothing on disk, so both aliases must survive.
+#[test]
+fn test_anchor_plain_rename_same_inode_keeps_both_aliases() {
+    let sb = TestSandbox::with_anchor_mode();
+    let a = sb.host_create_file("a", b"linked");
+    std::fs::hard_link(&a, sb.root.join("b")).unwrap();
+    let entry_a = sb.lookup_root("a").unwrap();
+    let entry_b = sb.lookup_root("b").unwrap();
+    assert_eq!(entry_a.inode, entry_b.inode);
+
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("a"),
+            ROOT_INODE,
+            &TestSandbox::cstr("b"),
+            0,
+        )
+        .unwrap();
+
+    {
+        let inodes = sb.fs.inodes.read().unwrap();
+        let data = inodes.get(&entry_a.inode).unwrap();
+        assert_eq!(data.aliases.read().unwrap().len(), 2);
+    }
+
+    assert!(sb.root.join("a").exists());
+    assert!(sb.root.join("b").exists());
+    let handle = sb.fuse_open(entry_a.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(
+        &sb.fuse_read(entry_a.inode, handle, 8, 0).unwrap()[..],
+        b"linked"
+    );
+}
+
+/// Renaming inside a directory the guest has already forgotten must not
+/// collect that directory: the new alias is registered before the old one is
+/// removed, so the parent never loses its last dependent.
+#[test]
+fn test_anchor_rename_after_parent_forgotten() {
+    let sb = TestSandbox::with_anchor_mode();
+    sb.host_create_dir("p");
+    sb.host_create_file("p/f", b"body");
+    let parent = sb.lookup_root("p").unwrap();
+    let file = sb.lookup(parent.inode, "f").unwrap();
+    sb.fs.forget(sb.ctx(), parent.inode, 1);
+
+    sb.fs
+        .rename(
+            sb.ctx(),
+            parent.inode,
+            &TestSandbox::cstr("f"),
+            parent.inode,
+            &TestSandbox::cstr("g"),
+            0,
+        )
+        .unwrap();
+
+    assert!(sb.fs.inodes.read().unwrap().get(&parent.inode).is_some());
+    let handle = sb.fuse_open(file.inode, libc::O_RDONLY as u32).unwrap();
+    assert_eq!(
+        &sb.fuse_read(file.inode, handle, 8, 0).unwrap()[..],
+        b"body"
+    );
+}
+
+/// Unlinking a symlink drops its alias even though the pre-unlink open fails
+/// `ELOOP`: the identity comes from the directory entry, not from an fd.
+#[test]
+fn test_anchor_unlink_symlink_drops_alias() {
+    let sb = TestSandbox::with_anchor_mode();
+    std::os::unix::fs::symlink("elsewhere", sb.root.join("sl")).unwrap();
+    let link = sb.lookup_root("sl").unwrap();
+
+    sb.fs
+        .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("sl"))
+        .unwrap();
+
+    let inodes = sb.fs.inodes.read().unwrap();
+    let data = inodes.get(&link.inode).unwrap();
+    assert!(data.aliases.read().unwrap().is_empty());
+    assert_eq!(
+        data.anchor_parent
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: teardown
+//--------------------------------------------------------------------------------------------------
+
+/// `destroy` must release the fds retained for unlinked inodes. They are raw
+/// numbers, so only the inode's destructor closes them.
+#[test]
+fn test_anchor_destroy_closes_retained_fds() {
+    let sb = TestSandbox::with_anchor_mode();
+    let (entry, handle) = sb.fuse_create_root("doomed").unwrap();
+    sb.fuse_write(entry.inode, handle, b"bye", 0).unwrap();
+    sb.fs
+        .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("doomed"))
+        .unwrap();
+
+    let retained = {
+        let inodes = sb.fs.inodes.read().unwrap();
+        inodes
+            .get(&entry.inode)
+            .unwrap()
+            .unlinked_fd
+            .load(std::sync::atomic::Ordering::Acquire)
+    };
+    assert!(retained >= 0);
+    let before = platform::fstat(retained as i32).unwrap();
+
+    sb.fs.destroy();
+
+    // The number is free after the close, and the test binary runs its tests
+    // in threads, so a parallel test may already have reopened it. Either the
+    // number is invalid, or it now names a different file — both prove this
+    // descriptor was released.
+    let probe = unsafe { libc::fcntl(retained as i32, libc::F_GETFD) };
+    if probe == -1 {
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    } else {
+        let after = platform::fstat(retained as i32).unwrap();
+        assert!(
+            platform::stat_ino(&after) != platform::stat_ino(&before)
+                || platform::stat_dev(&after) != platform::stat_dev(&before),
+            "retained fd {retained} still names the unlinked file after destroy"
+        );
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: symlink fd identity
+//--------------------------------------------------------------------------------------------------
+
+/// The symlink fd open refuses a replaced name outright, whether the
+/// replacement is a regular file or another symlink: the tracked identity no
+/// longer lives under that name.
+#[test]
+fn test_open_symlink_inode_fd_rejects_replacement() {
+    let sb = TestSandbox::with_anchor_mode();
+    std::os::unix::fs::symlink("elsewhere", sb.root.join("sl")).unwrap();
+    let link = sb.lookup_root("sl").unwrap();
+
+    std::fs::remove_file(sb.root.join("sl")).unwrap();
+    std::fs::write(sb.root.join("sl"), b"not a symlink").unwrap();
+    TestSandbox::assert_errno(
+        super::super::metadata::open_symlink_inode_fd_macos(&sb.fs, link.inode),
+        LINUX_ENOENT,
+    );
+
+    std::fs::remove_file(sb.root.join("sl")).unwrap();
+    std::os::unix::fs::symlink("somewhere-else", sb.root.join("sl")).unwrap();
+    TestSandbox::assert_errno(
+        super::super::metadata::open_symlink_inode_fd_macos(&sb.fs, link.inode),
+        LINUX_ENOENT,
+    );
+}
