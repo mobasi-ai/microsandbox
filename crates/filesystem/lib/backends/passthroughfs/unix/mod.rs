@@ -429,13 +429,9 @@ impl PassthroughFs {
             refcount: AtomicU64::new(2), // libfuse convention: root gets refcount 2
             #[cfg(target_os = "linux")]
             mnt_id,
-            #[cfg(target_os = "linux")]
             anchor_parent: AtomicU64::new(0),
-            #[cfg(target_os = "linux")]
             anchor_name: RwLock::new(Vec::new()),
-            #[cfg(target_os = "linux")]
             aliases: RwLock::new(std::collections::BTreeSet::new()),
-            #[cfg(target_os = "linux")]
             anchor_children: AtomicU64::new(0),
             #[cfg(target_os = "linux")]
             retained_fd: Mutex::new(None),
