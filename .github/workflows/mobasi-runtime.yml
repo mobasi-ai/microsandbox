@@ -1,0 +1,277 @@
+name: Mobasi Runtime
+
+# Builds the patched Windows runtime archive that Mobasi pins by URL and
+# SHA-256. The shape copies release.yml and release-windows.yml of upstream
+# v0.7.13: agentd (x86_64 musl) is built from this commit and embedded in
+# msb.exe, and the archive holds msb.exe and the official libkrunfw.dll.
+# MOBASI-PATCHES.md lists the patches that this branch carries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "New release tag, for example v0.7.13-mobasi.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobasi-runtime-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.99.1" # the rustc of the upstream v0.7.13 msb.exe
+  UPSTREAM_REPO: superradcompany/microsandbox
+  UPSTREAM_TAG: v0.7.13
+  UPSTREAM_COMMIT: 44c1e63176259e048f42893a5779de8b08fe0ec6
+  MSB_VERSION: "0.7.13"
+  LIBKRUNFW_ASSET: libkrunfw-windows-x86_64.dll
+  LIBKRUNFW_SHA256: 27eecc02dd0fe080bdee2e12d1a1ca229ab53cabec863a6bf992d8b5a5129f08
+  ARCHIVE: microsandbox-windows-x86_64.zip
+
+jobs:
+  check-input:
+    name: Check input
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check release tag
+        env:
+          TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v0\.7\.13-mobasi\.[0-9]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists"; exit 1
+          fi
+
+  agentd:
+    name: Agentd (x86_64-linux-musl)
+    needs: check-input
+    runs-on: ubuntu-24.04
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build agentd
+        run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+
+      - name: Hash agentd
+        id: hash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/x86_64-unknown-linux-musl/release/agentd out/agentd
+          echo "sha256=$(sha256sum out/agentd | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          { rustc -vV; cargo -V; musl-gcc --version 2>/dev/null | head -1 || true; echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; } > out/toolchain-agentd.txt
+          cat out/toolchain-agentd.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agentd
+          path: out/
+          compression-level: 0
+
+  msb:
+    name: msb.exe (x86_64-pc-windows-msvc)
+    needs: agentd
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # libkrunfw provides the MSVC environment helper that upstream uses.
+      - name: Checkout libkrunfw build helpers
+        shell: pwsh
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentd
+          path: embed/
+
+      - name: Check agentd hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hash = (Get-FileHash embed\agentd -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "${{ needs.agentd.outputs.sha256 }}") { throw "agentd hash mismatch: $hash" }
+
+      - name: Build msb
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:MSB_EMBED_ARTIFACTS_DIR = "$env:GITHUB_WORKSPACE\embed"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture x64 -HostArchitecture x64
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\msb.exe out\msb.exe -Force
+          $cl = (cmd /c "cl 2>&1" | Select-Object -First 1) -join ""
+          @(
+            (rustc -vV) -join "`n"
+            (cargo -V)
+            "cl: $cl"
+            "VCToolsVersion=$env:VCToolsVersion"
+            "WindowsSDKVersion=$env:WindowsSDKVersion"
+            "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          ) | Set-Content -Encoding utf8 out\toolchain-msb.txt
+          Get-Content out\toolchain-msb.txt
+
+      - name: Get official libkrunfw.dll
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path upstream | Out-Null
+          gh release download $env:UPSTREAM_TAG -R $env:UPSTREAM_REPO -D upstream -p $env:LIBKRUNFW_ASSET -p checksums.sha256 -p msb-windows-x86_64.exe
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $hash = (Get-FileHash "upstream\$env:LIBKRUNFW_ASSET" -Algorithm SHA256).Hash.ToLower()
+          $listed = (Select-String -Path upstream\checksums.sha256 -Pattern "  $([regex]::Escape($env:LIBKRUNFW_ASSET))$").Line.Split(" ")[0]
+          if ($hash -ne $env:LIBKRUNFW_SHA256 -or $hash -ne $listed) { throw "libkrunfw hash mismatch: $hash (listed $listed)" }
+          Copy-Item "upstream\$env:LIBKRUNFW_ASSET" out\libkrunfw.dll -Force
+
+      - name: Check version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ours = (& out\msb.exe --version | Out-String).Trim()
+          $theirs = (& upstream\msb-windows-x86_64.exe --version | Out-String).Trim()
+          Write-Output "fork: $ours"
+          Write-Output "upstream: $theirs"
+          if ($ours -ne $theirs) { throw "version output differs from upstream" }
+          if ($ours -notmatch "(^|\s)$([regex]::Escape($env:MSB_VERSION))$") { throw "unexpected version: $ours" }
+
+      - name: Smoke test installed runtime discovery
+        shell: pwsh
+        run: python scripts/smoke/cli/runtime-discovery.py --msb out/msb.exe --libkrunfw out/libkrunfw.dll
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msb
+          path: out/
+          compression-level: 0
+
+  release:
+    name: Package and release
+    needs: [agentd, msb]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentd
+          path: in/agentd/
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: msb
+          path: in/msb/
+
+      - name: Package
+        env:
+          TAG: ${{ inputs.release_tag }}
+          AGENTD_SHA256: ${{ needs.agentd.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPO" "refs/tags/$UPSTREAM_TAG:refs/upstream-tag"
+          upstream_commit=$(git rev-parse 'refs/upstream-tag^{commit}')
+          [ "$upstream_commit" = "$UPSTREAM_COMMIT" ] || { echo "upstream tag moved: $upstream_commit"; exit 1; }
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$GITHUB_SHA"
+
+          libkrun_rev=$(grep -A2 '^name = "msb_krun"$' Cargo.lock | sed -n 's/^source = "git+.*#\([0-9a-f]\{40\}\)"$/\1/p')
+          [ -n "$libkrun_rev" ] || { echo "msb_krun is not a git source in Cargo.lock"; exit 1; }
+
+          [ "$(sha256sum in/agentd/agentd | cut -d' ' -f1)" = "$AGENTD_SHA256" ]
+          [ "$(sha256sum in/msb/libkrunfw.dll | cut -d' ' -f1)" = "$LIBKRUNFW_SHA256" ]
+          python3 -I -c 'import sys; a=open(sys.argv[1],"rb").read(); m=open(sys.argv[2],"rb").read(); sys.exit(0 if a in m else "agentd is not embedded in msb.exe")' in/agentd/agentd in/msb/msb.exe
+
+          mkdir -p stage dist
+          cp in/msb/msb.exe in/msb/libkrunfw.dll stage/
+          epoch=$(git log -1 --format=%ct "$GITHUB_SHA")
+          touch -d "@$epoch" stage/msb.exe stage/libkrunfw.dll
+          (cd stage && TZ=UTC zip -q -X "../dist/$ARCHIVE" msb.exe libkrunfw.dll)
+          (cd dist && sha256sum "$ARCHIVE" > "$ARCHIVE.sha256")
+
+          msb_sha=$(sha256sum stage/msb.exe | cut -d' ' -f1)
+          zip_sha=$(cut -d' ' -f1 "dist/$ARCHIVE.sha256")
+          jq -n \
+            --arg tag "$TAG" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg commit "$GITHUB_SHA" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            --arg up_repo "$UPSTREAM_REPO" --arg up_tag "$UPSTREAM_TAG" --arg up_commit "$upstream_commit" \
+            --arg libkrun_rev "$libkrun_rev" \
+            --arg version "$MSB_VERSION" \
+            --arg archive "$ARCHIVE" --arg zip_sha "$zip_sha" \
+            --arg agentd_sha "$AGENTD_SHA256" --arg msb_sha "$msb_sha" \
+            --arg krunfw_asset "$LIBKRUNFW_ASSET" --arg krunfw_sha "$LIBKRUNFW_SHA256" \
+            --rawfile tc_agentd in/agentd/toolchain-agentd.txt \
+            --rawfile tc_msb in/msb/toolchain-msb.txt \
+            '{
+              release_tag: $tag,
+              msb_version: $version,
+              fork: { repository: $repo, ref: $ref, commit: $commit, workflow_run: $run },
+              upstream: { repository: $up_repo, tag: $up_tag, commit: $up_commit },
+              libkrun: { repository: "mobasi-ai/libkrun", rev: $libkrun_rev, upstream_pr: "https://github.com/superradcompany/libkrun/pull/177" },
+              archive: { name: $archive, sha256: $zip_sha },
+              files: {
+                "msb.exe": { sha256: $msb_sha, target: "x86_64-pc-windows-msvc" },
+                "libkrunfw.dll": { sha256: $krunfw_sha, source: ("https://github.com/" + $up_repo + "/releases/download/" + $up_tag + "/" + $krunfw_asset) }
+              },
+              embedded_agentd: { sha256: $agentd_sha, target: "x86_64-unknown-linux-musl", built_from: $commit },
+              toolchain: { agentd: $tc_agentd, msb: $tc_msb }
+            }' > dist/provenance.json
+          cat dist/provenance.json
+          cat "dist/$ARCHIVE.sha256"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/${{ env.ARCHIVE }}
+            stage/msb.exe
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          notes="Patched Windows runtime for Microsandbox $UPSTREAM_TAG ($UPSTREAM_COMMIT). Built from $GITHUB_SHA by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. See MOBASI-PATCHES.md and provenance.json."
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes "$notes" \
+            "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" dist/provenance.json
