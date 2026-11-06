@@ -225,15 +225,15 @@ russh-sftp = "2.3.0"
 
 # Mobasi patch: carry superradcompany/libkrun#177 (Windows 10 WHP state lookup). See MOBASI-PATCHES.md.
 [patch.crates-io]
-msb_krun = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_arch = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_arch_gen = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_cpuid = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_devices = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_hvf = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_kernel = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_polly = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_smbios = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_utils = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb_krun_vmm = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
-msb-vm-memory = { git = "https://github.com/mobasi-ai/libkrun", rev = "826560dd09b4e731e73c5f9e6470492760cb0967" }
+msb_krun = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_arch = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_arch_gen = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_cpuid = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_devices = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_hvf = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_kernel = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_polly = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_smbios = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_utils = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb_krun_vmm = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }
+msb-vm-memory = { git = "https://github.com/mobasi-ai/libkrun", rev = "f7f9644b0519cc510ce4e8dc85302a63a98d7b4d" }

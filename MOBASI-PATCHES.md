@@ -14,7 +14,7 @@ publishes it as a release asset with its SHA-256 and `provenance.json`.
 
 - Upstream PR: https://github.com/superradcompany/libkrun/pull/177
 - Source: `mobasi-ai/libkrun` branch `fix/whp-state-runtime-lookup`,
-  rev `7291cb9f5be6b45305e4c725d6c778f3d9c87f29` (now carried inside rev `826560dd`, see patch 2). It sits on upstream
+  rev `7291cb9f5be6b45305e4c725d6c778f3d9c87f29` (now carried inside rev `f7f9644b`, see patch 2). It sits on upstream
   libkrun `cd518196`, which is `msb_krun` 0.1.42 plus one CI-only commit.
 - How: `[patch.crates-io]` in `Cargo.toml` replaces all 11 `msb_krun*`
   crates with that git rev. In `Cargo.lock`, only the source of the
@@ -34,7 +34,7 @@ publishes it as a release asset with its SHA-256 and `provenance.json`.
 
 - Upstream PR: none yet (spike, 2026-11-06).
 - Source: `mobasi-ai/libkrun` branch `mobasi/dynamic-memory`, rev
-  `826560dd09b4e731e73c5f9e6470492760cb0967`, on top of patch 1.
+  `f7f9644b0519cc510ce4e8dc85302a63a98d7b4d`, on top of patch 1.
 - How: the `[patch.crates-io]` table points all 11 `msb_krun*` crates and
   `msb-vm-memory` at that rev. The libkrun branch vendors `msb-vm-memory`
   0.18.0-msb.2 under `third_party/` with one added constructor,
