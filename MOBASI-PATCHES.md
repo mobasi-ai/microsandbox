@@ -44,10 +44,15 @@ publishes it as a release asset with its SHA-256 and `provenance.json`.
   Windows wrote zeros into the block instead of releasing it, so a shrink
   made the host use more memory. Linux was already correct.
 - What: Windows reserves the hotplug region, commits and maps each block on
-  plug (a refused commit answers NACK), and unmaps and decommits it on unplug.
-  macOS unmaps an unplugged block, replaces its pages, and maps it again;
-  its free page reporting uses `MADV_FREE_REUSABLE`.
+  plug, and unmaps and decommits it on unplug. A plug that Windows cannot
+  commit, or that would leave less than 512 MiB of system commit or of the
+  job memory limit, answers BUSY, so the guest keeps its size and retries
+  later. macOS unmaps an unplugged block, replaces its pages, and maps it
+  again. The VMM worker thread now starts when the VM has a virtio-mem
+  device (before, the first unplug on macOS waited for ever). macOS free page
+  reporting uses `MADV_FREE_REUSABLE`; it does not lower the footprint yet.
 - Targets: Windows x86_64 and macOS aarch64. Linux builds the same code as
   before.
 - Not done: snapshot capture and dirty tracking of blocks that Windows maps
-  after boot.
+  after boot; returning reported free pages on macOS (needs the same unmap,
+  replace, map steps as unplug).
