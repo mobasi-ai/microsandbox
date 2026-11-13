@@ -59,4 +59,26 @@ Write-Output ("  Windows application crash events for msb.exe since the start: {
 $crashes | Select-Object -First 2 | ForEach-Object { "    " + (($_.Message -split "`n" | Select-Object -First 8) -join " | ") }
 & $Msb ps 2>&1 | Select-String $name | ForEach-Object { "  $_" }
 & $Msb stop $name 2>&1 | Out-Null; & $Msb remove -f $name 2>&1 | Out-Null
+
+# A queue in a block that the guest then unplugs: the VMM process must end with an access
+# violation, which ends this VM only. This part starts a new VM.
+Step "second VM: put the queue of the device in a block and unplug that block"
+$started2 = Get-Date
+& $Msb run -d -n $name --memory 1G --max-memory 3G --cpus 2 alpine -- sleep 100000 2>$null | Select-Object -Last 1
+Start-Sleep 3
+& $Msb exec $name -- sh -c "echo $source | base64 -d > /root/hostile.c" 2>&1 | Out-Null
+& $Msb exec $name -- sh -c "echo $prepare | base64 -d | sh" 2>&1 | ForEach-Object { "  $_" }
+& $Msb modify $name --memory 3G 2>&1 | Out-Null
+Start-Sleep 2
+$vm3 = VmProc
+& $Msb exec $name -- sh -c "/root/hostile `$(cat /root/mmio) ringmove; echo exit=`$?" 2>&1 | Select-Object -First 8 | ForEach-Object { "  $_" }
+Start-Sleep 5
+$vm4 = VmProc
+if ($vm4 -and $vm3.Id -eq $vm4.Id) { Write-Output "  the VM process still runs" } else { Write-Output "  the VM process stopped" }
+$crashes2 = @(Get-WinEvent -FilterHashtable @{ LogName = "Application"; Id = 1000; StartTime = $started2 } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "msb.exe" })
+Write-Output ("  Windows application crash events for msb.exe in this part: {0}" -f $crashes2.Count)
+$crashes2 | Select-Object -First 1 | ForEach-Object { "    " + ((($_.Message -split "`n") | Where-Object { $_ -match "Exception code|Faulting module name|Fault offset" }) -join " | ") }
+$os = Get-CimInstance Win32_OperatingSystem
+Write-Output ("  host after it: commit in use {0:N2} GB, free RAM {1:N2} GB, msb processes {2}" -f (($os.TotalVirtualMemorySize - $os.FreeVirtualMemory)/1MB), ($os.FreePhysicalMemory/1MB), @(Get-Process msb -ErrorAction SilentlyContinue).Count)
+& $Msb stop $name 2>&1 | Out-Null; & $Msb remove -f $name 2>&1 | Out-Null
 Write-Output "done"

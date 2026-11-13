@@ -27,7 +27,7 @@ step "put the hostile driver in the guest and take the device from the kernel"
 step "the host asks for the full size; only the hostile driver can plug now"
 "$MSB" modify "$NAME" --memory 3G >/dev/null 2>&1
 sleep 2
-for mode in "info" "model $STEPS 1" "model $STEPS 77" "racesafe 15" "race 15" "touch" "model $STEPS 5"; do
+for mode in "info" "model $STEPS 1" "model $STEPS 77" "racesafe 15" "race 15" "touch" "ringmove" "resetloop 300000" "model $STEPS 5"; do
   step "hostile $mode (host $(host_mib))"
   "$MSB" exec "$NAME" -- sh -c "/root/hostile \$(cat /root/mmio) $mode; echo exit=\$?" 2>&1 | sed 's/^/  /'
 done

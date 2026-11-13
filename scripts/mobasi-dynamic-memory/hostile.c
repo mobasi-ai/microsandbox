@@ -14,6 +14,10 @@
 //                      all the time, also when it is not plugged
 //   racesafe SECONDS   the same, but the other thread stops before each unplug, as a correct
 //                      driver does: each access must find memory, and the memory must hold data
+//   ringmove           put the virtqueue and its buffers in a plugged block, then unplug that
+//                      block through the same queue
+//   resetloop COUNT    reset and start the device COUNT times; the memory of the VMM process
+//                      must not grow without limit (the caller measures it)
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
@@ -76,30 +80,23 @@ static void read_config(void) {
   blocks = region_size / BLOCK;
 }
 
-static void setup(uint64_t base) {
-  devmem = open("/dev/mem", O_RDWR | O_SYNC);
-  if (devmem < 0) die("/dev/mem");
-  reg = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, devmem, base);
-  if (reg == MAP_FAILED) die("mmap of the device registers");
-  if (R(0x000) != 0x74726976 || R(0x008) != 24) {
-    fprintf(stderr, "not a virtio-mem device: magic=%x id=%u\n", R(0x000), R(0x008));
-    exit(2);
+// Reset the device and give it a virtqueue. `queue` holds the descriptor table and the rings,
+// `buffers` holds the request and the response. Both are one page, at the given guest-physical
+// addresses.
+static void handshake(uint8_t *queue, uint64_t queue_phys, uint8_t *buffers, uint64_t buffers_phys) {
+  // Not memset: on arm64 it can use an instruction that is not permitted on a /dev/mem mapping.
+  for (int i = 0; i < 4096; i += 8) {
+    *(volatile uint64_t *)(queue + i) = 0;
+    *(volatile uint64_t *)(buffers + i) = 0;
   }
-  // Two locked pages hold the virtqueue and the buffers. Their guest-physical addresses come
-  // from the page map.
-  uint8_t *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED | MAP_POPULATE, -1, 0);
-  if (pages == MAP_FAILED) die("mmap of the queue pages");
-  memset(pages, 0, 8192);
-  desc = (void *)pages;
-  avail = (void *)(pages + 0x100);
-  used = (void *)(pages + 0x200);
-  request = (void *)(pages + 4096);
-  response = (void *)(pages + 4096 + 0x100);
-  uint64_t queue_phys = phys_of(pages);
-  request_phys = phys_of(request);
-  response_phys = phys_of(response);
-
+  desc = (void *)queue;
+  avail = (void *)(queue + 0x100);
+  used = (void *)(queue + 0x200);
+  request = (void *)buffers;
+  response = (void *)(buffers + 0x100);
+  request_phys = buffers_phys;
+  response_phys = buffers_phys + 0x100;
+  avail_idx = 0;
   // The device takes one status flag for each write.
   R(0x070) = 0;
   R(0x070) = 1;
@@ -119,6 +116,30 @@ static void setup(uint64_t base) {
   R(0x0a0) = (uint32_t)(queue_phys + 0x200); R(0x0a4) = (queue_phys + 0x200) >> 32;
   R(0x044) = 1;
   R(0x070) = 1 | 2 | 8 | 4;
+}
+
+static uint8_t *own_pages;
+
+// A queue in two locked pages of this program. Their guest-physical addresses come from the
+// page map.
+static void own_queue(void) {
+  handshake(own_pages, phys_of(own_pages), own_pages + 4096, phys_of(own_pages + 4096));
+}
+
+static void setup(uint64_t base) {
+  devmem = open("/dev/mem", O_RDWR | O_SYNC);
+  if (devmem < 0) die("/dev/mem");
+  reg = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, devmem, base);
+  if (reg == MAP_FAILED) die("mmap of the device registers");
+  if (R(0x000) != 0x74726976 || R(0x008) != 24) {
+    fprintf(stderr, "not a virtio-mem device: magic=%x id=%u\n", R(0x000), R(0x008));
+    exit(2);
+  }
+  own_pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED | MAP_POPULATE, -1, 0);
+  if (own_pages == MAP_FAILED) die("mmap of the queue pages");
+  memset(own_pages, 0, 8192);
+  own_queue();
   read_config();
   memory = mmap(NULL, region_size, PROT_READ | PROT_WRITE, MAP_SHARED, devmem, region_addr);
   if (memory == MAP_FAILED) { perror("mmap of the hotplug region (no data checks)"); memory = NULL; }
@@ -388,8 +409,44 @@ static int racesafe(unsigned seconds) {
   return wrong != 0 || not_zero != 0;
 }
 
+// The virtqueue and its buffers are in a plugged block, and a request through that queue
+// unplugs the block. The device must then write its answer and the used ring to memory that it
+// has just released. A host that keeps the region mapped writes to the new zero pages. On
+// Windows the host memory is gone, and the VMM process ends with an access violation: the VM
+// dies, and nothing else.
+static int ringmove(void) {
+  if (!memory) { printf("ringmove: cannot map the hotplug region\n"); return 1; }
+  send(UNPLUG_ALL, 0, 0, NULL);
+  if (send(PLUG, region_addr + 5 * BLOCK, 1, NULL) != ACK) { printf("FAIL: plug\n"); return 1; }
+  uint8_t *block = (uint8_t *)(uintptr_t)memory + 5 * BLOCK;
+  handshake(block, region_addr + 5 * BLOCK, block + 4096, region_addr + 5 * BLOCK + 4096);
+  uint16_t state = 9;
+  int got = send(STATE, region_addr + 5 * BLOCK, 1, &state);
+  printf("ringmove: a request through a queue in block 5: %s, state %u\n", got < 0 ? "no answer" : resp_name[got & 3], state);
+  printf("ringmove: unplug block 5 through that queue now\n"); fflush(stdout);
+  got = send(UNPLUG, region_addr + 5 * BLOCK, 1, NULL);
+  printf("ringmove: the unplug answered %s\n", got < 0 ? "nothing" : resp_name[got & 3]); fflush(stdout);
+  // Back to a queue in memory of this program. The device must still work.
+  own_queue();
+  got = send(STATE, region_addr + 5 * BLOCK, 1, &state);
+  printf("ringmove: after it, block 5 is %s (%s)\n", state == 1 ? "unplugged" : state == 0 ? "plugged" : "?", got < 0 ? "no answer" : resp_name[got & 3]);
+  send(UNPLUG_ALL, 0, 0, NULL);
+  if (got != ACK) { printf("FAIL: the device does not answer\n"); return 1; }
+  printf("ringmove: done\n");
+  return 0;
+}
+
+static int resetloop(uint64_t count) {
+  for (uint64_t i = 0; i < count; i++) own_queue();
+  uint16_t state = 9;
+  int got = send(STATE, region_addr, 1, &state);
+  printf("resetloop: %llu resets, then the device answers %s\n", (unsigned long long)count,
+         got < 0 ? "nothing" : resp_name[got & 3]);
+  return got != ACK;
+}
+
 int main(int argc, char **argv) {
-  if (argc < 3) { fprintf(stderr, "usage: hostile <mmio base> info|model|touch|race|racesafe ...\n"); return 2; }
+  if (argc < 3) { fprintf(stderr, "usage: hostile <mmio base> info|model|touch|race|racesafe|ringmove ...\n"); return 2; }
   setup(strtoull(argv[1], NULL, 16));
   printf("device: region 0x%llx size %llu MiB (%llu blocks), requested %llu MiB, plugged %llu MiB, unplugged_inaccessible=%d\n",
          (unsigned long long)region_addr, (unsigned long long)(region_size >> 20), (unsigned long long)blocks,
@@ -400,5 +457,7 @@ int main(int argc, char **argv) {
   if (!strcmp(argv[2], "touch")) return touch();
   if (!strcmp(argv[2], "race")) return race(argc > 3 ? atoi(argv[3]) : 10);
   if (!strcmp(argv[2], "racesafe")) return racesafe(argc > 3 ? atoi(argv[3]) : 10);
+  if (!strcmp(argv[2], "ringmove")) return ringmove();
+  if (!strcmp(argv[2], "resetloop")) return resetloop(argc > 3 ? strtoull(argv[3], NULL, 0) : 100000);
   return 2;
 }
