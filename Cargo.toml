@@ -226,15 +226,15 @@ russh-sftp = "2.3.0"
 # Mobasi patch: the VM engine from the Mobasi libkrun fork, which gives the host memory of
 # unplugged virtio-mem blocks back on macOS and Windows. See MOBASI-PATCHES.md.
 [patch.crates-io]
-msb_krun = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_arch = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_arch_gen = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_cpuid = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_devices = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_hvf = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_kernel = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_polly = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_smbios = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_utils = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb_krun_vmm = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
-msb-vm-memory = { git = "https://github.com/mobasi-ai/libkrun", rev = "c8389a615e73e2be6baafb40df716f66e168b50a" }
+msb_krun = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_arch = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_arch_gen = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_cpuid = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_devices = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_hvf = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_kernel = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_polly = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_smbios = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_utils = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb_krun_vmm = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
+msb-vm-memory = { git = "https://github.com/mobasi-ai/libkrun", rev = "33bea64bdb19632bcbfdf2df9b499475faf04baa" }
