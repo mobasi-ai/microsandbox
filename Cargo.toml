@@ -226,9 +226,9 @@ rpassword = "7"
 russh = "0.65.0"
 russh-sftp = "2.3.0"
 
-# Temporary native APIs from libkrun PR #173, pinned for reproducible builds.
-# Replace these patches with the maintainer's published native version before
-# publishing dependent crates: workspace patches do not propagate to consumers.
+# Mobasi patches: carry Windows virtio-fs positional OVERLAPPED I/O
+# (mobasi-ai/libkrun branch mobasi/win-positional-io, based on upstream 77cad8a1).
+# See MOBASI-PATCHES.md.
 [patch.crates-io]
-msb_krun = { git = "https://github.com/superradcompany/libkrun", rev = "77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3" }
-msb_krun_utils = { git = "https://github.com/superradcompany/libkrun", rev = "77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3" }
+msb_krun = { git = "https://github.com/mobasi-ai/libkrun", rev = "4eb6bff4c10e3af736e2af6f3123756a31f57b77" }
+msb_krun_utils = { git = "https://github.com/mobasi-ai/libkrun", rev = "4eb6bff4c10e3af736e2af6f3123756a31f57b77" }
