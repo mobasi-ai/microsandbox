@@ -946,15 +946,17 @@ fn rebuild(
             ));
         }
         let snapshot = saved.entries.as_ref().map(|entries| {
-            entries
-                .iter()
-                .map(|entry| DirSnapshotEntry {
-                    inode: entry.inode,
-                    name: entry.name.clone(),
-                    offset: entry.offset,
-                    file_type: entry.file_type,
-                })
-                .collect()
+            Arc::new(
+                entries
+                    .iter()
+                    .map(|entry| DirSnapshotEntry {
+                        inode: entry.inode,
+                        name: entry.name.clone(),
+                        offset: entry.offset,
+                        file_type: entry.file_type,
+                    })
+                    .collect(),
+            )
         });
         dirs.insert(
             saved.handle,

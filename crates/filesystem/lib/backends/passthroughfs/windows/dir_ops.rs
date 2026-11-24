@@ -11,7 +11,7 @@ impl PassthroughFs {
         &self,
         inode: u64,
         handle: u64,
-    ) -> io::Result<Vec<DirSnapshotEntry>> {
+    ) -> io::Result<Arc<Vec<DirSnapshotEntry>>> {
         let handle = self
             .dir_handles
             .read()
@@ -22,19 +22,9 @@ impl PassthroughFs {
             .ok_or_else(|| linux_error(LINUX_EBADF))?;
         let mut snapshot = handle.snapshot.lock().unwrap();
         if snapshot.is_none() {
-            *snapshot = Some(
-                self.dir_entries(inode)?
-                    .into_iter()
-                    .map(|(entry, _)| DirSnapshotEntry {
-                        inode: entry.ino,
-                        name: entry.name.to_vec(),
-                        offset: entry.offset,
-                        file_type: entry.type_,
-                    })
-                    .collect(),
-            );
+            *snapshot = Some(Arc::new(self.dir_entries(inode)?));
         }
-        Ok(snapshot.as_ref().unwrap().clone())
+        Ok(Arc::clone(snapshot.as_ref().unwrap()))
     }
 
     pub(super) fn snapshot_entry_attributes(&self, entry: &DirSnapshotEntry) -> io::Result<Entry> {
@@ -46,7 +36,7 @@ impl PassthroughFs {
         self.entry_from_metadata(&metadata, data.as_ref())
     }
 
-    pub(super) fn dir_entries(&self, inode: u64) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
+    pub(super) fn dir_entries(&self, inode: u64) -> io::Result<Vec<DirSnapshotEntry>> {
         let data = self.inode(inode)?;
         let metadata = self.safe_metadata(&data.path())?;
         if !metadata.file_type().is_dir() {
@@ -54,35 +44,26 @@ impl PassthroughFs {
         }
 
         let mut entries = Vec::new();
-        entries.push((
-            DirEntry {
-                ino: inode,
-                offset: 1,
-                type_: DT_DIR,
-                name: b".",
-            },
-            self.entry_from_metadata(&metadata, data.as_ref())?,
-        ));
-        entries.push((
-            DirEntry {
-                ino: ROOT_INODE,
-                offset: 2,
-                type_: DT_DIR,
-                name: b"..",
-            },
-            self.parent_entry(data.as_ref())?,
-        ));
+        entries.push(DirSnapshotEntry {
+            inode,
+            name: b".".to_vec(),
+            offset: 1,
+            file_type: DT_DIR,
+        });
+        entries.push(DirSnapshotEntry {
+            inode: ROOT_INODE,
+            name: b"..".to_vec(),
+            offset: 2,
+            file_type: DT_DIR,
+        });
 
         if self.cfg.inject_init && inode == ROOT_INODE {
-            entries.push((
-                DirEntry {
-                    ino: INIT_INODE,
-                    offset: entries.len() as u64 + 1,
-                    type_: DT_REG,
-                    name: INIT_NAME,
-                },
-                init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout),
-            ));
+            entries.push(DirSnapshotEntry {
+                inode: INIT_INODE,
+                name: INIT_NAME.to_vec(),
+                offset: entries.len() as u64 + 1,
+                file_type: DT_REG,
+            });
         }
 
         for entry in std::fs::read_dir(data.path()).map_err(host_error)? {
@@ -107,27 +88,15 @@ impl PassthroughFs {
             };
             let child = self.intern_path(path)?;
             let full_entry = self.entry_from_metadata(&metadata, child.as_ref())?;
-            let dir_entry = DirEntry {
-                ino: child.inode,
+            entries.push(DirSnapshotEntry {
+                inode: child.inode,
+                name: name.to_bytes().to_vec(),
                 offset: entries.len() as u64 + 1,
-                type_: dirent_type_from_mode(full_entry.attr.st_mode),
-                name: leak_name(name.to_bytes()),
-            };
-            entries.push((dir_entry, full_entry));
+                file_type: dirent_type_from_mode(full_entry.attr.st_mode),
+            });
         }
 
         Ok(entries)
-    }
-
-    pub(super) fn parent_entry(&self, data: &InodeData) -> io::Result<Entry> {
-        let path = data.path();
-        let parent_path = path.parent().unwrap_or(&self.root);
-        let parent_path = if data.inode == ROOT_INODE || !parent_path.starts_with(&self.root) {
-            self.root.clone()
-        } else {
-            parent_path.to_path_buf()
-        };
-        self.entry_for_path(parent_path)
     }
 }
 
@@ -135,7 +104,16 @@ impl PassthroughFs {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-pub(super) fn snapshot_dir_entry(entry: DirSnapshotEntry) -> DirEntry<'static> {
+pub(super) fn borrowed_dir_entry(entry: &DirSnapshotEntry) -> DirEntry<'_> {
+    DirEntry {
+        ino: entry.inode,
+        offset: entry.offset,
+        type_: entry.file_type,
+        name: &entry.name,
+    }
+}
+
+pub(super) fn snapshot_dir_entry(entry: &DirSnapshotEntry) -> DirEntry<'static> {
     DirEntry {
         ino: entry.inode,
         offset: entry.offset,

@@ -531,13 +531,22 @@ fn collect_backend_entries(
     let (dir_handle, _) = backend(fs, backend_id).opendir(ctx, backend_inode, 0)?;
     let dir_handle_val = dir_handle.unwrap_or(0);
 
-    let child_entries =
-        backend(fs, backend_id).readdir(ctx, backend_inode, dir_handle_val, u32::MAX, 0)?;
+    let mut child_entries: Vec<(u64, u32, Vec<u8>)> = Vec::new();
+    let list_result = backend(fs, backend_id).readdir_for_each(
+        ctx,
+        backend_inode,
+        dir_handle_val,
+        u32::MAX,
+        0,
+        &mut |entry| {
+            child_entries.push((entry.ino, entry.type_, entry.name.to_vec()));
+            Ok(1)
+        },
+    );
     let _ = backend(fs, backend_id).releasedir(ctx, backend_inode, 0, dir_handle_val);
+    list_result?;
 
-    for entry in child_entries {
-        let name = entry.name.to_vec();
-
+    for (entry_ino, entry_type, name) in child_entries {
         // Skip . and ..
         if name == b"." || name == b".." {
             continue;
@@ -564,9 +573,9 @@ fn collect_backend_entries(
         if let Some(guest_ino) = auto_register_readdir(
             fs,
             ctx,
-            entry.ino,
+            entry_ino,
             &name,
-            entry.type_,
+            entry_type,
             guest_parent,
             backend_inode,
             backend_id,
@@ -575,7 +584,7 @@ fn collect_backend_entries(
                 name,
                 inode: guest_ino,
                 offset: *off,
-                file_type: entry.type_,
+                file_type: entry_type,
             });
             *off += 1;
         }

@@ -45,7 +45,7 @@ pub(super) struct HandleData {
 pub(super) struct DirHandle {
     pub(super) inode: u64,
     pub(super) flags: u32,
-    pub(super) snapshot: Mutex<Option<Vec<DirSnapshotEntry>>>,
+    pub(super) snapshot: Mutex<Option<Arc<Vec<DirSnapshotEntry>>>>,
 }
 
 #[derive(Clone)]

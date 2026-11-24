@@ -732,7 +732,7 @@ fn directory_rename_preserves_cached_descendants() {
         fs.release(context(), file.inode, 0, handle, false, false, None)
             .unwrap();
         let entries = fs.dir_entries(nested.inode).unwrap();
-        assert!(entries.iter().any(|(entry, _)| entry.name == b"file"));
+        assert!(entries.iter().any(|entry| entry.name == b"file"));
         assert_eq!(
             fs.lookup(context(), ROOT_INODE, c"moved").unwrap().inode,
             directory.inode
@@ -771,7 +771,7 @@ fn host_side_rename_keeps_directory_listable() {
         .dir_entries(sub.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"g.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
@@ -799,7 +799,7 @@ fn host_hard_link_keeps_both_names() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"a.txt".to_vec()) && names.contains(&b"b.txt".to_vec()));
     fs.getattr(context(), a.inode, None).unwrap();
@@ -827,7 +827,7 @@ fn host_rename_of_cached_hard_link_keeps_alias_usable() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"c.txt".to_vec()), "{names:?}");
@@ -850,7 +850,7 @@ fn host_rename_of_cached_hard_link_repairs_during_listing() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"c.txt".to_vec()), "{names:?}");
@@ -883,7 +883,7 @@ fn host_directory_rename_moves_cached_descendants() {
         .dir_entries(nested.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"file.txt".to_vec()), "{names:?}");
     // Lookups under the new name return the cached inodes.
@@ -933,7 +933,7 @@ fn host_move_into_recreated_parent_path_repairs_once() {
         .dir_entries(moved.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"nested".to_vec()), "{names:?}");
     let (stat, _) = fs.getattr(context(), file.inode, None).unwrap();
@@ -3551,4 +3551,93 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
     )
     .unwrap();
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn readdir_for_each_and_readdirplus_for_each_resume_across_chunks() {
+    let temp = TempDir::new();
+    for index in 0..25 {
+        std::fs::write(temp.path.join(format!("file-{index:02}.txt")), b"data").unwrap();
+    }
+    let fs = fs_for(&temp.path);
+    let (handle, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+
+    // First call populates the snapshot; subsequent calls must reuse the same Arc.
+    let snap1 = fs.dir_snapshot(ROOT_INODE, handle).unwrap();
+    let snap2 = fs.dir_snapshot(ROOT_INODE, handle).unwrap();
+    assert!(Arc::ptr_eq(&snap1, &snap2));
+
+    // Stream via readdir_for_each accepting at most 4 entries per call.
+    let mut seen_readdir = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let mut batch = 0usize;
+        let mut last_offset = offset;
+        fs.readdir_for_each(
+            context(),
+            ROOT_INODE,
+            handle,
+            4096,
+            offset,
+            &mut |entry| {
+                if batch >= 4 {
+                    return Ok(0);
+                }
+                seen_readdir.push(String::from_utf8(entry.name.to_vec()).unwrap());
+                last_offset = entry.offset;
+                batch += 1;
+                Ok(entry.name.len() + 24)
+            },
+        )
+        .unwrap();
+        if batch == 0 {
+            break;
+        }
+        offset = last_offset;
+    }
+
+    // Stream via readdirplus_for_each accepting at most 3 entries per call.
+    let mut seen_plus = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let mut batch = 0usize;
+        let mut last_offset = offset;
+        fs.readdirplus_for_each(
+            context(),
+            ROOT_INODE,
+            handle,
+            4096,
+            offset,
+            &mut |entry, full| {
+                if batch >= 3 {
+                    return Ok(0);
+                }
+                assert_eq!(entry.ino, full.inode);
+                seen_plus.push(String::from_utf8(entry.name.to_vec()).unwrap());
+                last_offset = entry.offset;
+                batch += 1;
+                Ok(entry.name.len() + 128)
+            },
+        )
+        .unwrap();
+        if batch == 0 {
+            break;
+        }
+        offset = last_offset;
+    }
+
+    assert_eq!(seen_readdir.len(), 27); // "." + ".." + 25 files
+    assert_eq!(seen_readdir, seen_plus);
+    let unique: std::collections::BTreeSet<_> = seen_readdir.iter().cloned().collect();
+    assert_eq!(unique.len(), 27);
+    assert!(unique.contains("."));
+    assert!(unique.contains(".."));
+    for index in 0..25 {
+        assert!(unique.contains(&format!("file-{index:02}.txt")));
+    }
+
+    fs.releasedir(context(), ROOT_INODE, 0, handle).unwrap();
 }
