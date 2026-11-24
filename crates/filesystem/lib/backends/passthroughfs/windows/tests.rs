@@ -732,7 +732,7 @@ fn directory_rename_preserves_cached_descendants() {
         fs.release(context(), file.inode, 0, handle, false, false, None)
             .unwrap();
         let entries = fs.dir_entries(nested.inode).unwrap();
-        assert!(entries.iter().any(|(entry, _)| entry.name == b"file"));
+        assert!(entries.iter().any(|entry| entry.name == b"file"));
         assert_eq!(
             fs.lookup(context(), ROOT_INODE, c"moved").unwrap().inode,
             directory.inode
@@ -771,7 +771,7 @@ fn host_side_rename_keeps_directory_listable() {
         .dir_entries(sub.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"g.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
@@ -799,7 +799,7 @@ fn host_hard_link_keeps_both_names() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"a.txt".to_vec()) && names.contains(&b"b.txt".to_vec()));
     fs.getattr(context(), a.inode, None).unwrap();
@@ -827,7 +827,7 @@ fn host_rename_of_cached_hard_link_keeps_alias_usable() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"c.txt".to_vec()), "{names:?}");
@@ -850,7 +850,7 @@ fn host_rename_of_cached_hard_link_repairs_during_listing() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"c.txt".to_vec()), "{names:?}");
@@ -883,7 +883,7 @@ fn host_directory_rename_moves_cached_descendants() {
         .dir_entries(nested.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"file.txt".to_vec()), "{names:?}");
     // Lookups under the new name return the cached inodes.
@@ -933,7 +933,7 @@ fn host_move_into_recreated_parent_path_repairs_once() {
         .dir_entries(moved.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name)
         .collect();
     assert!(names.contains(&b"nested".to_vec()), "{names:?}");
     let (stat, _) = fs.getattr(context(), file.inode, None).unwrap();
@@ -3551,4 +3551,483 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
     )
     .unwrap();
     assert!(seen.lock().unwrap().is_empty());
+}
+
+fn create_junction(link: &Path, target: &Path) {
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mklink /J failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn nested_dotdot_matches_actual_parent_inode() {
+    let temp = TempDir::new();
+    std::fs::create_dir_all(temp.path.join("parent").join("child")).unwrap();
+    let fs = fs_for(&temp.path);
+    let parent = fs.lookup(context(), ROOT_INODE, c"parent").unwrap();
+    let child = fs.lookup(context(), parent.inode, c"child").unwrap();
+
+    let (dh, _) = fs
+        .opendir(context(), child.inode, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let dh = dh.unwrap();
+    let mut dotdot = None;
+    fs.readdirplus_for_each(
+        context(),
+        child.inode,
+        dh,
+        4096,
+        0,
+        &mut |dir_entry, full| {
+            if dir_entry.name == b".." {
+                dotdot = Some((dir_entry.ino, full.inode));
+            }
+            Ok(dir_entry.name.len() + 128)
+        },
+    )
+    .unwrap();
+    assert_eq!(dotdot, Some((parent.inode, parent.inode)));
+    assert_ne!(parent.inode, ROOT_INODE);
+    fs.releasedir(context(), child.inode, 0, dh).unwrap();
+}
+
+#[test]
+fn truncating_open_through_swapped_junction_never_modifies_outside_canary() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    std::fs::create_dir_all(root.join("dir")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("dir").join("target.txt"), b"inside-data").unwrap();
+    std::fs::write(outside.join("target.txt"), b"OUTSIDE-MUST-SURVIVE").unwrap();
+
+    let fs = fs_for(&root);
+    let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap();
+    let target = fs.lookup(context(), dir.inode, c"target.txt").unwrap();
+
+    // Swap `root/dir` for a junction to `outside`, then attempt O_RDWR | O_TRUNC.
+    std::fs::remove_dir_all(root.join("dir")).unwrap();
+    create_junction(&root.join("dir"), &outside);
+    expect_errno(
+        fs.open(
+            context(),
+            target.inode,
+            false,
+            (LINUX_O_RDWR | LINUX_O_TRUNC) as u32,
+        ),
+        LINUX_ELOOP,
+    );
+    // The outside canary file must remain completely untouched.
+    assert_eq!(
+        std::fs::read(outside.join("target.txt")).unwrap(),
+        b"OUTSIDE-MUST-SURVIVE"
+    );
+}
+
+#[test]
+fn host_file_replacement_assigns_fresh_inode_and_stales_old_inode() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("item.txt"), b"first").unwrap();
+    let fs = fs_for(&temp.path);
+    let first = fs.lookup(context(), ROOT_INODE, c"item.txt").unwrap();
+
+    // Replace on the host with a distinct file object (different FileId).
+    std::fs::remove_file(temp.path.join("item.txt")).unwrap();
+    std::fs::write(temp.path.join("other.txt"), b"occupy").unwrap();
+    std::fs::write(temp.path.join("item.txt"), b"second").unwrap();
+
+    // Old inode reference must fail with ESTALE rather than silently opening the replacement.
+    expect_errno(fs.getattr(context(), first.inode, None), LINUX_ESTALE);
+    expect_errno(fs.open(context(), first.inode, false, 0), LINUX_ESTALE);
+
+    // Fresh lookup must drop the stale path alias and assign a new guest inode.
+    let second = fs.lookup(context(), ROOT_INODE, c"item.txt").unwrap();
+    assert_ne!(second.inode, first.inode);
+    assert_eq!(second.attr.st_size, 6);
+}
+
+#[test]
+fn rejects_windows_reserved_device_names_and_handles_case_mismatch_via_fallback() {
+    for reserved in [c"CON", c"nul.txt", c"COM1", c"lpt9.log", c"CONIN$", c"AUX"] {
+        expect_errno(validate_component(reserved), LINUX_EPERM);
+    }
+
+    let temp = TempDir::new();
+    std::fs::create_dir_all(temp.path.join("SubDir")).unwrap();
+    std::fs::write(temp.path.join("SubDir").join("MixedCase.txt"), b"hello").unwrap();
+    let fs = fs_for(&temp.path);
+    // Lookup with different ASCII case forces exact-match miss -> anchored NtCreateFile fallback.
+    let sub = fs.lookup(context(), ROOT_INODE, c"subdir").unwrap();
+    let file = fs.lookup(context(), sub.inode, c"mixedcase.txt").unwrap();
+    assert_eq!(file.attr.st_size, 5);
+    let (fh, _) = fs.open(context(), file.inode, false, 0).unwrap();
+    assert_eq!(owned_read(&fs, file.inode, fh.unwrap()), b"hello");
+}
+
+#[test]
+fn batched_readdirplus_matches_lookup_identity_and_skips_junctions() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+    create_junction(&root.join("escape"), &outside);
+
+    // Populate 120 files + a subdirectory so FileIdBothDirectoryInfo exercises multi-entry
+    // batching and identity matching against GetFileInformationByHandle.
+    std::fs::create_dir(root.join("sub")).unwrap();
+    for index in 0..120 {
+        std::fs::write(
+            root.join(format!("item-{index:03}.txt")),
+            format!("payload-{index:03}"),
+        )
+        .unwrap();
+    }
+
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: root.clone(),
+        inject_init: false,
+        stat_virtualization: StatVirtualization::Off,
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO)
+        .unwrap();
+
+    let (handle, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+
+    let mut listed = std::collections::BTreeMap::new();
+    let mut offset = 0u64;
+    loop {
+        let mut batch = 0usize;
+        let mut last_offset = offset;
+        fs.readdirplus_for_each(
+            context(),
+            ROOT_INODE,
+            handle,
+            4096,
+            offset,
+            &mut |dir_entry, entry| {
+                if batch >= 11 {
+                    return Ok(0);
+                }
+                assert_eq!(dir_entry.ino, entry.inode);
+                let name = String::from_utf8(dir_entry.name.to_vec()).unwrap();
+                listed.insert(name, entry);
+                last_offset = dir_entry.offset;
+                batch += 1;
+                Ok(dir_entry.name.len() + 128)
+            },
+        )
+        .unwrap();
+        if batch == 0 {
+            break;
+        }
+        offset = last_offset;
+    }
+    fs.releasedir(context(), ROOT_INODE, 0, handle).unwrap();
+
+    assert!(!listed.contains_key("escape"), "junction must be skipped");
+    assert_eq!(listed.len(), 123); // "." + ".." + "sub" + 120 files
+
+    // Every FileIdBothDirectoryInfo inode must match subsequent single-handle lookup.
+    for index in [0usize, 59, 119] {
+        let name = format!("item-{index:03}.txt");
+        let c_name = std::ffi::CString::new(name.as_str()).unwrap();
+        let from_readdir = listed.get(&name).unwrap();
+        let from_lookup = fs.lookup(context(), ROOT_INODE, &c_name).unwrap();
+        assert_eq!(from_readdir.inode, from_lookup.inode);
+        assert_eq!(from_readdir.attr.st_size, from_lookup.attr.st_size);
+        assert_eq!(from_readdir.attr.st_mode, from_lookup.attr.st_mode);
+    }
+    let sub_from_readdir = listed.get("sub").unwrap();
+    let sub_from_lookup = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
+    assert_eq!(sub_from_readdir.inode, sub_from_lookup.inode);
+    assert_eq!(sub_from_readdir.attr.st_mode & S_IFMT, S_IFDIR);
+}
+
+#[test]
+fn single_handle_lookup_rejects_intermediate_junctions_outside_and_inside_root() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    std::fs::create_dir_all(root.join("dir").join("sub")).unwrap();
+    std::fs::create_dir_all(root.join("other").join("sub")).unwrap();
+    std::fs::create_dir_all(outside.join("sub")).unwrap();
+    std::fs::write(root.join("dir").join("sub").join("file.txt"), b"inside").unwrap();
+    std::fs::write(root.join("other").join("sub").join("file.txt"), b"sibling").unwrap();
+    std::fs::write(outside.join("sub").join("file.txt"), b"secret").unwrap();
+
+    let fs = fs_for(&root);
+    let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap();
+    let sub = fs.lookup(context(), dir.inode, c"sub").unwrap();
+    let file = fs.lookup(context(), sub.inode, c"file.txt").unwrap();
+
+    // Swap cached intermediate directory `root/dir` for a junction pointing OUTSIDE root.
+    std::fs::remove_dir_all(root.join("dir")).unwrap();
+    create_junction(&root.join("dir"), &outside);
+    expect_errno(fs.lookup(context(), sub.inode, c"file.txt"), LINUX_ELOOP);
+    expect_errno(fs.getattr(context(), file.inode, None), LINUX_ELOOP);
+    expect_errno(fs.open(context(), file.inode, false, 0), LINUX_ELOOP);
+    expect_errno(
+        fs.opendir(context(), sub.inode, LINUX_O_DIRECTORY as u32),
+        LINUX_ELOOP,
+    );
+
+    // Swap `root/dir` for a junction pointing to ANOTHER directory INSIDE root (`root/other`).
+    std::fs::remove_dir(root.join("dir")).unwrap();
+    create_junction(&root.join("dir"), &root.join("other"));
+    expect_errno(fs.lookup(context(), sub.inode, c"file.txt"), LINUX_ELOOP);
+    expect_errno(fs.getattr(context(), file.inode, None), LINUX_ELOOP);
+    expect_errno(fs.open(context(), file.inode, false, 0), LINUX_ELOOP);
+}
+
+#[test]
+fn concurrent_host_mutator_never_escapes_root_during_lookup_and_readdir() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    std::fs::create_dir_all(root.join("slot")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("slot").join("safe.txt"), b"safe-content").unwrap();
+    std::fs::write(outside.join("canary.txt"), b"OUTSIDE-CANARY-SECRET").unwrap();
+    std::fs::write(outside.join("safe.txt"), b"OUTSIDE-CANARY-SECRET").unwrap();
+
+    let fs = Arc::new(
+        PassthroughFs::new(PassthroughConfig {
+            root_dir: root.clone(),
+            inject_init: false,
+            stat_virtualization: StatVirtualization::Off,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    fs.init(FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO)
+        .unwrap();
+    let slot = fs.lookup(context(), ROOT_INODE, c"slot").unwrap();
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mutator_stop = Arc::clone(&stop);
+    let mutator_root = root.clone();
+    let mutator_outside = outside.clone();
+    let mutator = std::thread::spawn(move || {
+        let slot_path = mutator_root.join("slot");
+        let backup_path = mutator_root.join("slot_backup");
+        while !mutator_stop.load(Ordering::Relaxed) {
+            if std::fs::rename(&slot_path, &backup_path).is_ok() {
+                let _ = Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(&slot_path)
+                    .arg(&mutator_outside)
+                    .output();
+                std::thread::yield_now();
+                let _ = std::fs::remove_dir(&slot_path);
+                let _ = std::fs::rename(&backup_path, &slot_path);
+            }
+            std::thread::yield_now();
+        }
+    });
+
+    for _ in 0..200 {
+        // Never allow lookup of the outside-only canary file.
+        if let Ok(entry) = fs.lookup(context(), slot.inode, c"canary.txt") {
+            panic!("escaped root: looked up outside canary inode {}", entry.inode);
+        }
+        // If `safe.txt` is opened, its bytes must never come from `outside/safe.txt`.
+        if let Ok(entry) = fs.lookup(context(), slot.inode, c"safe.txt")
+            && let Ok((Some(fh), _)) = fs.open(context(), entry.inode, false, 0)
+        {
+            let mut writer = CaptureWriter { bytes: Vec::new() };
+            if fs
+                .read(context(), entry.inode, fh, &mut writer, 64, 0, None, 0)
+                .is_ok()
+            {
+                assert_ne!(
+                    writer.bytes, b"OUTSIDE-CANARY-SECRET",
+                    "escaped root: read outside canary bytes"
+                );
+            }
+            let _ = fs.release(context(), entry.inode, 0, fh, false, false, None);
+        }
+        // Directory listing of `slot` must never expose `canary.txt`.
+        if let Ok((Some(dh), _)) = fs.opendir(context(), slot.inode, LINUX_O_DIRECTORY as u32) {
+            let _ = fs.readdirplus_for_each(
+                context(),
+                slot.inode,
+                dh,
+                4096,
+                0,
+                &mut |dir_entry, _| {
+                    assert_ne!(
+                        dir_entry.name, b"canary.txt",
+                        "escaped root: readdirplus exposed outside canary"
+                    );
+                    Ok(dir_entry.name.len() + 128)
+                },
+            );
+            let _ = fs.releasedir(context(), slot.inode, 0, dh);
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    mutator.join().unwrap();
+}
+
+#[test]
+fn readdirplus_sees_live_size_of_open_unclosed_writable_file() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (created, fh, _) = fs
+        .create(
+            context(),
+            ROOT_INODE,
+            c"live.bin",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+    let fh = fh.unwrap();
+    let mut reader = SourceReader {
+        bytes: vec![0xAB; 4096],
+        pos: 0,
+    };
+    fs.write(
+        context(),
+        created.inode,
+        fh,
+        &mut reader,
+        4096,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+
+    // Without closing `fh`, readdirplus must still report the live 4096-byte size.
+    let (dh, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let dh = dh.unwrap();
+    let mut found_size = None;
+    fs.readdirplus_for_each(
+        context(),
+        ROOT_INODE,
+        dh,
+        4096,
+        0,
+        &mut |dir_entry, entry| {
+            if dir_entry.name == b"live.bin" {
+                found_size = Some(entry.attr.st_size);
+            }
+            Ok(dir_entry.name.len() + 128)
+        },
+    )
+    .unwrap();
+    assert_eq!(found_size, Some(4096));
+    fs.releasedir(context(), ROOT_INODE, 0, dh).unwrap();
+    fs.release(context(), created.inode, 0, fh, false, false, None)
+        .unwrap();
+}
+
+#[test]
+fn setattr_without_handle_rejects_stale_replaced_inode_before_mutation() {
+    let temp = TempDir::new();
+    let target = temp.path.join("file.txt");
+    std::fs::write(&target, b"original-contents").unwrap();
+
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"file.txt").unwrap();
+
+    // Replace `file.txt` on the host with a brand new file (different file identity).
+    let replacement = temp.path.join("replacement.tmp");
+    std::fs::write(&replacement, b"keep-me-intact-12345").unwrap();
+    std::fs::remove_file(&target).unwrap();
+    std::fs::rename(&replacement, &target).unwrap();
+    let before_meta = std::fs::metadata(&target).unwrap();
+    let before_mtime = before_meta.modified().unwrap();
+
+    // Handle-less truncate on the stale inode must fail with ESTALE without mutating replacement.
+    let attr = stat64 {
+        st_size: 0,
+        ..Default::default()
+    };
+    expect_errno(
+        fs.setattr(context(), entry.inode, attr, None, SetattrValid::SIZE),
+        LINUX_ESTALE,
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep-me-intact-12345");
+
+    // Handle-less timestamp update on the stale inode must also fail with ESTALE without mutating.
+    let time_attr = stat64 {
+        st_mtime: 1_600_000_000,
+        ..Default::default()
+    };
+    expect_errno(
+        fs.setattr(context(), entry.inode, time_attr, None, SetattrValid::MTIME),
+        LINUX_ESTALE,
+    );
+    assert_eq!(std::fs::metadata(&target).unwrap().modified().unwrap(), before_mtime);
+}
+
+#[test]
+fn create_with_o_trunc_rejects_junction_without_truncating_outside_target() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("victim.txt");
+    std::fs::write(&secret, b"do-not-truncate").unwrap();
+
+    let fs = fs_for(&root);
+    let sub = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
+
+    // Replace `root/sub` with a junction to `outside`.
+    std::fs::remove_dir(root.join("sub")).unwrap();
+    create_junction(&root.join("sub"), &outside);
+
+    expect_errno(
+        fs.create(
+            context(),
+            sub.inode,
+            c"victim.txt",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_WRONLY | LINUX_O_TRUNC) as u32,
+            0,
+            Extensions::default(),
+        ),
+        LINUX_ELOOP,
+    );
+    assert_eq!(std::fs::read(&secret).unwrap(), b"do-not-truncate");
+}
+
+#[test]
+fn invalid_input_offset_error_maps_to_linux_einval() {
+    let err = host_error(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "file offset out of range",
+    ));
+    assert_eq!(err.raw_os_error(), Some(LINUX_EINVAL));
+    assert_eq!(valid_file_identity(1, 0), None);
+    assert_eq!(valid_file_identity(1, u64::MAX), None);
+    assert_eq!(valid_file_identity(1, 42), Some((1, 42)));
 }

@@ -45,10 +45,9 @@ pub(super) struct HandleData {
 pub(super) struct DirHandle {
     pub(super) inode: u64,
     pub(super) flags: u32,
-    pub(super) snapshot: Mutex<Option<Vec<DirSnapshotEntry>>>,
+    pub(super) snapshot: Mutex<Option<Arc<Vec<DirSnapshotEntry>>>>,
 }
 
-#[derive(Clone)]
 pub(super) struct DirSnapshotEntry {
     pub(super) inode: u64,
     pub(super) name: Vec<u8>,
@@ -73,8 +72,7 @@ impl PassthroughFs {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .map_err(host_error)?;
-        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
-        mobility::file_identity(&file).map(Some)
+        WinFileInfo::from_handle(&file).map(|info| info.identity)
     }
 
     pub(super) fn record_owned_entry(&self, entry: Entry) -> Entry {
@@ -152,11 +150,11 @@ impl PassthroughFs {
     }
 
     pub(super) fn insert_root(&self) -> io::Result<Entry> {
-        let metadata = self.safe_metadata(&self.root)?;
+        let info = self.open_verified_file_info(&self.root)?;
         let data = Arc::new(InodeData {
             inode: ROOT_INODE,
             path: RwLock::new(self.root.clone()),
-            identity: self.path_identity(&self.root)?,
+            identity: info.identity,
             virtual_meta: RwLock::new(VirtualMetadata::default()),
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
@@ -173,7 +171,7 @@ impl PassthroughFs {
             inodes.by_identity.insert(identity, data.clone());
         }
 
-        self.entry_from_metadata(&metadata, data.as_ref())
+        self.entry_from_file_info(&info, data.as_ref())
     }
 
     pub(super) fn inode(&self, inode: u64) -> io::Result<Arc<InodeData>> {
@@ -188,13 +186,30 @@ impl PassthroughFs {
 
     pub(super) fn intern_path(&self, path: PathBuf) -> io::Result<Arc<InodeData>> {
         let identity = self.path_identity(&path)?;
+        self.intern_path_with_identity(path, identity)
+    }
+
+    pub(super) fn intern_path_with_identity(
+        &self,
+        path: PathBuf,
+        identity: Option<(u32, u64)>,
+    ) -> io::Result<Arc<InodeData>> {
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.by_path.get(&path).cloned() {
-            // A cached alias (hard link) can outlive the canonical name.
-            if identity.is_some() && data.identity == identity {
-                Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+            // If both identities are known and differ, the host replaced the object at
+            // `path` with a different file: drop the stale path alias instead of binding
+            // the replacement to the old guest inode.
+            if let (Some(cached_id), Some(live_id)) = (data.identity, identity)
+                && cached_id != live_id
+            {
+                inodes.by_path.remove(&path);
+            } else {
+                // A cached alias (hard link) can outlive the canonical name.
+                if identity.is_some() && data.identity == identity {
+                    Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+                }
+                return Ok(data);
             }
-            return Ok(data);
         }
         if let Some(identity) = identity
             && let Some(data) = inodes.by_identity.get(&identity).cloned()
@@ -324,9 +339,9 @@ impl PassthroughFs {
     }
 
     pub(super) fn entry_for_path(&self, path: PathBuf) -> io::Result<Entry> {
-        let metadata = self.safe_metadata(&path)?;
-        let data = self.intern_path(path.clone())?;
-        self.entry_from_metadata(&metadata, data.as_ref())
+        let info = self.open_verified_file_info(&path)?;
+        let data = self.intern_path_with_identity(path, info.identity)?;
+        self.entry_from_file_info(&info, data.as_ref())
     }
 
     pub(super) fn do_lookup(&self, parent: u64, name: &CStr) -> io::Result<Entry> {

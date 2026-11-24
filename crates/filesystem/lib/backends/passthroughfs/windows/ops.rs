@@ -1,6 +1,6 @@
 //! DynFileSystem callback table for the Windows passthrough backend.
 
-use super::dir_ops::snapshot_dir_entry;
+use super::dir_ops::{borrowed_dir_entry, snapshot_dir_entry};
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
@@ -61,9 +61,9 @@ impl DynFileSystem for PassthroughFs {
         &self,
         _ctx: Context,
         inode: u64,
-        _handle: Option<u64>,
+        handle: Option<u64>,
     ) -> io::Result<(stat64, Duration)> {
-        self.do_getattr(inode)
+        self.do_getattr(inode, handle)
     }
 
     fn setattr(
@@ -146,8 +146,8 @@ impl DynFileSystem for PassthroughFs {
     fn unlink(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
         let path = self.child_path(parent, name)?;
-        let metadata = self.safe_metadata(&path)?;
-        if metadata.file_type().is_dir() {
+        let info = self.open_verified_file_info(&path)?;
+        if info.is_dir() {
             return Err(linux_error(LINUX_EISDIR));
         }
 
@@ -157,8 +157,8 @@ impl DynFileSystem for PassthroughFs {
     fn rmdir(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
         let path = self.child_path(parent, name)?;
-        let metadata = self.safe_metadata(&path)?;
-        if !metadata.file_type().is_dir() {
+        let info = self.open_verified_file_info(&path)?;
+        if !info.is_dir() {
             return Err(linux_error(LINUX_ENOTDIR));
         }
 
@@ -185,22 +185,28 @@ impl DynFileSystem for PassthroughFs {
         }
 
         let old_path = self.child_path(olddir, oldname)?;
-        self.safe_metadata(&old_path)?;
+        let old_info = self.open_verified_file_info(&old_path)?;
         let new_path = self.child_path(newdir, newname)?;
         let new_parent = new_path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
-        let parent_metadata = self.safe_metadata(new_parent)?;
-        if !parent_metadata.file_type().is_dir() {
+        let parent_info = self.open_verified_file_info(new_parent)?;
+        if !parent_info.is_dir() {
             return Err(linux_error(LINUX_ENOTDIR));
         }
-        if flags & RENAME_NOREPLACE != 0 && new_path.exists() {
-            return Err(linux_error(LINUX_EEXIST));
-        }
-        if new_path.exists() {
-            self.safe_metadata(&new_path)?;
-            if self.path_identity(&old_path)? == self.path_identity(&new_path)? {
-                // POSIX rename of two aliases of one inode is a namespace no-op.
-                return Ok(());
+        match self.open_verified_file_info(&new_path) {
+            Ok(new_info) => {
+                if flags & RENAME_NOREPLACE != 0 {
+                    return Err(linux_error(LINUX_EEXIST));
+                }
+                if let (Some(old_id), Some(new_id)) = (old_info.identity, new_info.identity)
+                    && old_id == new_id
+                {
+                    // POSIX rename of two aliases of one inode is a namespace no-op,
+                    // only when both sides report known, non-sentinel file identities.
+                    return Ok(());
+                }
             }
+            Err(error) if error.raw_os_error() == Some(LINUX_ENOENT) => {}
+            Err(error) => return Err(error),
         }
 
         self.rename_file(&old_path, &new_path)
@@ -254,7 +260,9 @@ impl DynFileSystem for PassthroughFs {
                 .ok_or_else(|| linux_error(LINUX_EBADF))?
                 .lock()
                 .unwrap();
-            return w.write_from(&init_file, size as usize, offset);
+            return w
+                .write_from(&init_file, size as usize, offset)
+                .map_err(host_error);
         }
 
         let handle = self.handle(inode, handle)?;
@@ -290,14 +298,15 @@ impl DynFileSystem for PassthroughFs {
         // host-file lock (another alias may already be operating on this file).
         let state = self.dax_files.get(&handle.file.lock().unwrap())?;
         let _operation = state.operation.lock().unwrap_or_else(|p| p.into_inner());
-        let old_len = self.inode_metadata(&data)?.len();
         let file = handle.file.lock().unwrap();
+        let old_len = file.metadata().map_err(host_error)?.len();
         let offset = if handle.flags & LINUX_O_APPEND as u32 != 0 {
-            file.metadata().map_err(host_error)?.len()
+            old_len
         } else {
             offset
         };
-        self.quota_charge_growth(old_len, offset.saturating_add(size as u64))?;
+        let _quota_guard =
+            self.quota_charge_growth(old_len, offset.saturating_add(size as u64))?;
         let result = r.read_to(&file, size as usize, offset).map_err(host_error);
         // Even a failed write may have extended the file before reporting an
         // error. Keep existing DAX readers coherent in either case.
@@ -450,8 +459,8 @@ impl DynFileSystem for PassthroughFs {
         }
 
         let data = self.inode(inode)?;
-        let metadata = self.safe_metadata(&data.path())?;
-        if !metadata.file_type().is_dir() {
+        let info = self.open_verified_file_info(&data.path())?;
+        if !info.is_dir() {
             return Err(linux_error(LINUX_ENOTDIR));
         }
 
@@ -475,12 +484,9 @@ impl DynFileSystem for PassthroughFs {
         _size: u32,
         offset: u64,
     ) -> io::Result<Vec<DirEntry<'static>>> {
-        Ok(self
-            .dir_snapshot(inode, handle)?
-            .into_iter()
-            .filter(|entry| entry.offset > offset)
-            .map(snapshot_dir_entry)
-            .collect())
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        Ok(snapshot[start..].iter().map(snapshot_dir_entry).collect())
     }
 
     fn readdir_for_each(
@@ -492,8 +498,10 @@ impl DynFileSystem for PassthroughFs {
         offset: u64,
         add_entry: &mut AddDirEntry<'_>,
     ) -> io::Result<()> {
-        for entry in self.dir_snapshot(inode, handle)? {
-            if entry.offset > offset && add_entry(snapshot_dir_entry(entry))? == 0 {
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        for entry in &snapshot[start..] {
+            if add_entry(borrowed_dir_entry(entry))? == 0 {
                 break;
             }
         }
@@ -508,17 +516,19 @@ impl DynFileSystem for PassthroughFs {
         _size: u32,
         offset: u64,
     ) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
-        let entries = self
-            .dir_snapshot(inode, handle)?
-            .into_iter()
-            .filter(|entry| entry.offset > offset)
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        let entries = snapshot[start..]
+            .iter()
             .map(|entry| {
-                let full = self.snapshot_entry_attributes(&entry)?;
+                let full = self.snapshot_entry_attributes(entry)?;
                 Ok((snapshot_dir_entry(entry), full))
             })
             .collect::<io::Result<Vec<_>>>()?;
-        for (_, entry) in &entries {
-            self.record_owned_lookup(entry.inode);
+        for (dir_entry, entry) in &entries {
+            if dir_entry.name != b"." && dir_entry.name != b".." {
+                self.record_owned_lookup(entry.inode);
+            }
         }
         Ok(entries)
     }
@@ -532,16 +542,18 @@ impl DynFileSystem for PassthroughFs {
         offset: u64,
         add_entry: &mut AddDirEntryPlus<'_>,
     ) -> io::Result<()> {
-        for entry in self.dir_snapshot(inode, handle)? {
-            if entry.offset <= offset {
-                continue;
-            }
-            let full = self.snapshot_entry_attributes(&entry)?;
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        for entry in &snapshot[start..] {
+            let full = self.snapshot_entry_attributes(entry)?;
             let id = full.inode;
-            if add_entry(snapshot_dir_entry(entry), full)? == 0 {
+            let is_dot = entry.name == b"." || entry.name == b"..";
+            if add_entry(borrowed_dir_entry(entry), full)? == 0 {
                 break;
             }
-            self.record_owned_lookup(id);
+            if !is_dot {
+                self.record_owned_lookup(id);
+            }
         }
         Ok(())
     }
@@ -592,8 +604,8 @@ impl DynFileSystem for PassthroughFs {
         }
 
         let data = self.inode(inode)?;
-        let metadata = self.safe_metadata(&data.path())?;
-        let st = self.stat_from_metadata(&metadata, data.as_ref())?;
+        let info = self.open_verified_file_info(&data.path())?;
+        let st = self.stat_from_file_info(&info, data.as_ref())?;
         check_access(_ctx, &st, mask)
     }
 

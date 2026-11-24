@@ -168,7 +168,7 @@ pub(crate) fn do_write(
     let fd = f.as_raw_fd();
     // Charge the quota for any growth past EOF before writing, so an
     // over-budget write is refused with ENOSPC rather than hitting the disk.
-    fs.quota_charge_to(fd, offset.saturating_add(size as u64))?;
+    let _quota_guard = fs.quota_charge_to(fd, offset.saturating_add(size as u64))?;
 
     let written = r.read_to(&f, size as usize, offset)?;
 

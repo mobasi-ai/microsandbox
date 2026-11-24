@@ -514,12 +514,19 @@ impl PassthroughFs {
         self.injects_init() && inode == init_binary::INIT_INODE
     }
 
-    /// Charge the quota for growing an open file to `new_end` bytes.
-    pub(crate) fn quota_charge_to(&self, fd: std::os::fd::RawFd, new_end: u64) -> io::Result<()> {
+    /// Charge the quota for growing an open file to `new_end` bytes and hold the
+    /// reservation until the caller's host mutation completes.
+    pub(crate) fn quota_charge_to(
+        &self,
+        fd: std::os::fd::RawFd,
+        new_end: u64,
+    ) -> io::Result<Option<super::quota::QuotaReservation<'_>>> {
         if let Some(quota) = &self.quota {
-            quota.charge(new_end.saturating_sub(super::quota::fd_size(fd)))?;
+            return quota
+                .reserve(new_end.saturating_sub(super::quota::fd_size(fd)))
+                .map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Capture the quota baseline now if it has not been captured yet.

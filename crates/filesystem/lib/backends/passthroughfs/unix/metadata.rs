@@ -228,7 +228,7 @@ pub(crate) fn do_setattr(
 
         // Quota: an extending truncate grows the file. Charge the growth past
         // EOF before ftruncate (a shrinking truncate charges nothing).
-        fs.quota_charge_to(fd, attr.st_size.max(0) as u64)?;
+        let _quota_guard = fs.quota_charge_to(fd, attr.st_size.max(0) as u64)?;
 
         let ret = unsafe { libc::ftruncate(fd, attr.st_size) };
         if ret < 0 {
