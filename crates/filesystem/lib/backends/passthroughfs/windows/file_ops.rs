@@ -44,6 +44,7 @@ impl PassthroughFs {
                 inode,
                 flags,
                 file: Mutex::new(file),
+                dirty: AtomicBool::new(flags & LINUX_O_TRUNC as u32 != 0),
             }),
         );
         Ok((Some(handle), OpenOptions::empty()))

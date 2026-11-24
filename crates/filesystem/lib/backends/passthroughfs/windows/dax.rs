@@ -67,6 +67,12 @@ pub(super) struct DaxWindows {
 #[derive(Default)]
 pub(super) struct DaxFiles {
     files: Mutex<BTreeMap<(u32, u64), Weak<DaxFileState>>>,
+    /// Host file identities that have had a writable DAX mapping since their last
+    /// `FlushFileBuffers` (`sync_data`/`sync_all`), shared across all hardlink aliases.
+    writable_dirty: Mutex<std::collections::BTreeSet<(u32, u64)>>,
+    /// Fast-path guard: false until the first writable DAX mapping is installed on
+    /// this mount so ordinary non-DAX `flush`/`fsync` pays zero identity queries.
+    any_writable: AtomicBool,
 }
 
 /// Shared by all open paths to a host file, independently of FUSE inode numbers.
@@ -75,6 +81,7 @@ pub(super) struct DaxFileState {
     /// Acquire before handle.file or map_windows; never in the opposite order.
     pub(super) operation: Mutex<()>,
     has_mappings: AtomicBool,
+    has_writable_mappings: AtomicBool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -146,6 +153,14 @@ impl PassthroughFs {
         let _operation = state
             .as_ref()
             .map(|state| state.operation.lock().unwrap_or_else(|p| p.into_inner()));
+        let writable_identity = if write {
+            source
+                .as_ref()
+                .map(|s| mobility::file_identity(&s.file))
+                .transpose()?
+        } else {
+            None
+        };
         let backing = if let Some(source) = source {
             DaxBacking::file(source, guest_addr, len as u64)?
         } else {
@@ -153,6 +168,9 @@ impl PassthroughFs {
         };
         let mut windows = self.map_windows.lock().unwrap_or_else(|p| p.into_inner());
         windows.install_backing(sender, guest_addr, len as u64, backing, write)?;
+        if let Some(identity) = writable_identity {
+            self.dax_files.mark_writable(identity);
+        }
         Ok(())
     }
 
@@ -185,7 +203,12 @@ impl PassthroughFs {
             // stale removal would then drop. The stage-2 mapping is torn down first
             // and the registry is only touched after the worker acknowledges, so a
             // failed removal retains the remaining backing for a retry.
+            // Flush any live writable views covering this range before unmapping
+            // and dropping them so dirty mapped pages are pushed to the file cache
+            // before UnmapViewOfFile runs (matching Windows's FlushViewOfFile +
+            // FlushFileBuffers durability contract).
             let mut windows = self.map_windows.lock().unwrap_or_else(|p| p.into_inner());
+            windows.flush_writable_views_in_range(guest_addr, request.len)?;
             windows.unmap_range(sender, guest_addr, request.len)?;
             // Windows cannot unmap part of a `MapViewOfFile`; dropping the removed
             // slot releases the whole view only once the last slot referencing it
@@ -375,6 +398,12 @@ impl DaxWindows {
         }
         if let Some(source) = &backing.source {
             source.state.has_mappings.store(true, Ordering::Release);
+            if writable {
+                source
+                    .state
+                    .has_writable_mappings
+                    .store(true, Ordering::Release);
+            }
         }
         remove_window_range(&mut self.slots, guest_addr, len)?;
         self.slots.insert(
@@ -449,6 +478,81 @@ impl DaxWindows {
             .map(|(key, _)| *key)
             .collect()
     }
+
+    /// Flush every live writable host file-mapping view intersecting
+    /// `[guest_addr, guest_addr + len)` before discarding its slot on removal.
+    pub(super) fn flush_writable_views_in_range(
+        &self,
+        guest_addr: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        let end = guest_addr.saturating_add(len);
+        let mut flushed = Vec::new();
+        for window in self
+            .slots
+            .range(..guest_addr)
+            .next_back()
+            .into_iter()
+            .chain(self.slots.range(guest_addr..end))
+            .map(|(_, window)| window)
+        {
+            if window.guest_addr.saturating_add(window.len) <= guest_addr
+                || window.guest_addr >= end
+            {
+                continue;
+            }
+            let Some(source) = &window.backing.source else {
+                continue;
+            };
+            if source.access != WindowsFileMappingAccess::ReadWrite {
+                continue;
+            }
+            let ptr = Arc::as_ptr(&window.backing);
+            if flushed.contains(&ptr) {
+                continue;
+            }
+            if let Some(view) = &window.backing.view {
+                view.flush().map_err(host_error)?;
+                flushed.push(ptr);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush every live writable host file-mapping view for `state` before
+    /// `FlushFileBuffers` (`sync_data`/`sync_all`), matching Windows's mapped-file
+    /// durability contract. Returns `true` if any writable view is currently mapped.
+    pub(super) fn flush_writable_views(&self, state: &Arc<DaxFileState>) -> io::Result<bool> {
+        let mut flushed = Vec::new();
+        let mut any_live_writable = false;
+        for window in self.slots.values() {
+            let Some(source) = &window.backing.source else {
+                continue;
+            };
+            if !Arc::ptr_eq(&source.state, state)
+                || source.access != WindowsFileMappingAccess::ReadWrite
+            {
+                continue;
+            }
+            any_live_writable = true;
+            let ptr = Arc::as_ptr(&window.backing);
+            if flushed.contains(&ptr) {
+                continue;
+            }
+            if let Some(view) = &window.backing.view {
+                view.flush().map_err(host_error)?;
+                flushed.push(ptr);
+            }
+        }
+        Ok(any_live_writable)
+    }
+}
+
+/// Lookup result for writable DAX state on a host file.
+pub(super) struct WritableDaxLookup {
+    pub(super) identity: (u32, u64),
+    pub(super) state: Option<Arc<DaxFileState>>,
+    pub(super) dirty: bool,
 }
 
 impl DaxFiles {
@@ -463,12 +567,57 @@ impl DaxFiles {
         files.insert(identity, Arc::downgrade(&state));
         Ok(state)
     }
+
+    pub(super) fn mark_writable(&self, identity: (u32, u64)) {
+        self.writable_dirty
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(identity);
+        self.any_writable.store(true, Ordering::Release);
+    }
+
+    pub(super) fn has_any_writable(&self) -> bool {
+        self.any_writable.load(Ordering::Acquire)
+    }
+
+    /// Look up existing DAX state and writable-dirty flag for `file` without
+    /// allocating a new `DaxFileState`.
+    pub(super) fn lookup_writable(&self, file: &File) -> io::Result<WritableDaxLookup> {
+        let identity = mobility::file_identity(file)?;
+        let state = self
+            .files
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&identity)
+            .and_then(Weak::upgrade);
+        let dirty = self
+            .writable_dirty
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&identity);
+        Ok(WritableDaxLookup {
+            identity,
+            state,
+            dirty,
+        })
+    }
+
+    pub(super) fn clear_writable_dirty(&self, identity: (u32, u64)) {
+        self.writable_dirty
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&identity);
+    }
 }
 
 impl DaxFileState {
     /// Called under operation, so setup cannot race the no-mappings fast path.
     pub(super) fn has_mappings(&self) -> bool {
         self.has_mappings.load(Ordering::Acquire)
+    }
+
+    pub(super) fn has_writable_mappings(&self) -> bool {
+        self.has_writable_mappings.load(Ordering::Acquire)
     }
 }
 

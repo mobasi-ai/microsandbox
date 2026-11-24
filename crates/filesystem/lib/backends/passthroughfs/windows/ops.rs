@@ -298,6 +298,7 @@ impl DynFileSystem for PassthroughFs {
             offset
         };
         self.quota_charge_growth(old_len, offset.saturating_add(size as u64))?;
+        handle.dirty.store(true, Ordering::Release);
         let result = r.read_to(&file, size as usize, offset).map_err(host_error);
         // Even a failed write may have extended the file before reporting an
         // error. Keep existing DAX readers coherent in either case.
@@ -335,7 +336,45 @@ impl DynFileSystem for PassthroughFs {
         if !open_flags_write(handle.flags) {
             return Ok(());
         }
-        handle.file.lock().unwrap().sync_data().map_err(host_error)
+        if self.dax_files.has_any_writable() {
+            let dax = {
+                let file = handle.file.lock().unwrap();
+                self.dax_files.lookup_writable(&file)?
+            };
+            if let Some(state) = dax.state
+                && state.has_writable_mappings()
+            {
+                let _operation = state.operation.lock().unwrap_or_else(|p| p.into_inner());
+                let still_mapped = self
+                    .map_windows
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .flush_writable_views(&state)?;
+                if still_mapped || dax.dirty || handle.dirty.load(Ordering::Acquire) {
+                    let file = handle.file.lock().unwrap();
+                    file.sync_data().map_err(host_error)?;
+                    handle.dirty.store(false, Ordering::Release);
+                }
+                if !still_mapped {
+                    self.dax_files.clear_writable_dirty(dax.identity);
+                }
+                return Ok(());
+            }
+            if dax.dirty {
+                let file = handle.file.lock().unwrap();
+                file.sync_data().map_err(host_error)?;
+                handle.dirty.store(false, Ordering::Release);
+                self.dax_files.clear_writable_dirty(dax.identity);
+                return Ok(());
+            }
+        }
+        let file = handle.file.lock().unwrap();
+        if !handle.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        file.sync_data().map_err(host_error)?;
+        handle.dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn fsync(&self, _ctx: Context, inode: u64, datasync: bool, handle: u64) -> io::Result<()> {
@@ -344,12 +383,41 @@ impl DynFileSystem for PassthroughFs {
         }
 
         let handle = self.handle(inode, handle)?;
+        if self.dax_files.has_any_writable() {
+            let dax = {
+                let file = handle.file.lock().unwrap();
+                self.dax_files.lookup_writable(&file)?
+            };
+            if let Some(state) = dax.state
+                && state.has_writable_mappings()
+            {
+                let _operation = state.operation.lock().unwrap_or_else(|p| p.into_inner());
+                let still_mapped = self
+                    .map_windows
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .flush_writable_views(&state)?;
+                let file = handle.file.lock().unwrap();
+                if datasync {
+                    file.sync_data().map_err(host_error)?;
+                } else {
+                    file.sync_all().map_err(host_error)?;
+                }
+                handle.dirty.store(false, Ordering::Release);
+                if !still_mapped {
+                    self.dax_files.clear_writable_dirty(dax.identity);
+                }
+                return Ok(());
+            }
+        }
         let file = handle.file.lock().unwrap();
         if datasync {
-            file.sync_data().map_err(host_error)
+            file.sync_data().map_err(host_error)?;
         } else {
-            file.sync_all().map_err(host_error)
+            file.sync_all().map_err(host_error)?;
         }
+        handle.dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn release(

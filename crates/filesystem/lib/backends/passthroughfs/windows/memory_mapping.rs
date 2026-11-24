@@ -13,8 +13,8 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    PAGE_READONLY, PAGE_READWRITE, UnmapViewOfFile, VirtualProtect,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, FlushViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile, PAGE_READONLY, PAGE_READWRITE, UnmapViewOfFile, VirtualProtect,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -188,6 +188,15 @@ impl WindowsFileMappingView {
     /// Host address of the requested view region.
     pub(super) fn host_addr(&self) -> u64 {
         self.host_ptr() as u64
+    }
+
+    /// Flush dirty pages of this mapped view back to the underlying file cache.
+    pub(super) fn flush(&self) -> io::Result<()> {
+        // SAFETY: `self.host_ptr()` and `self.len` describe the mapped region of this live view.
+        if unsafe { FlushViewOfFile(self.host_ptr().cast(), self.len) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Drop write access once the view's payload has been copied in.

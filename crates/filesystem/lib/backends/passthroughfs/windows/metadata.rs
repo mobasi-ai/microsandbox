@@ -229,6 +229,7 @@ impl PassthroughFs {
                 self.with_file_mappings_suspended(&state, || {
                     let file = handle.file.lock().unwrap();
                     self.quota_charge_growth(metadata.len(), size)?;
+                    handle.dirty.store(true, Ordering::Release);
                     file.set_len(size).map_err(host_error)
                 })?;
             } else {
@@ -236,7 +237,8 @@ impl PassthroughFs {
                     let file = self.open_inode_file(&data, LINUX_O_WRONLY as u32)?;
                     reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
                     self.quota_charge_growth(metadata.len(), size)?;
-                    file.set_len(size).map_err(host_error)
+                    file.set_len(size).map_err(host_error)?;
+                    file.sync_data().map_err(host_error)
                 })?;
             }
         }
@@ -285,12 +287,9 @@ impl PassthroughFs {
             let times = build_file_times(attr, valid)?;
             if let Some(handle) = handle {
                 let handle = self.handle(inode, handle)?;
-                handle
-                    .file
-                    .lock()
-                    .unwrap()
-                    .set_times(times)
-                    .map_err(host_error)?;
+                let file = handle.file.lock().unwrap();
+                handle.dirty.store(true, Ordering::Release);
+                file.set_times(times).map_err(host_error)?;
             } else {
                 let file = if data.retained.lock().unwrap().is_some() {
                     self.open_inode_file(&data, LINUX_O_WRONLY as u32)?
