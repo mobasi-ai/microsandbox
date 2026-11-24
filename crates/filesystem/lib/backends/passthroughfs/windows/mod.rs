@@ -746,7 +746,8 @@ fn leak_name(name: &[u8]) -> &'static [u8] {
 }
 
 fn host_error(error: io::Error) -> io::Error {
-    let errno = match error.raw_os_error() {
+    let raw_os_error = error.raw_os_error();
+    let errno = match raw_os_error {
         Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => LINUX_ENOENT,
         Some(ERROR_ACCESS_DENIED | ERROR_PRIVILEGE_NOT_HELD) => LINUX_EACCES,
         Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => LINUX_EEXIST,
@@ -764,7 +765,84 @@ fn host_error(error: io::Error) -> io::Error {
         },
     };
 
+    let kind = error.kind();
+    if errno == LINUX_EIO || errno == LINUX_EBUSY {
+        log_host_error(raw_os_error, kind, errno);
+    }
+
     linux_error(errno)
+}
+
+#[derive(Default)]
+struct ErrorRateLimiter {
+    buckets: BTreeMap<Option<i32>, (u64, u64)>,
+}
+
+impl ErrorRateLimiter {
+    const MIN_INTERVAL_MS: u64 = 1_000;
+    const MAX_TRACKED_CODES: usize = 64;
+
+    /// Returns `Some(suppressed_count)` when an event for `code` should be logged at `now_ms`,
+    /// or `None` when suppressed. Reserves one slot for the overflow bucket (`None`) so total
+    /// tracked buckets never exceeds `MAX_TRACKED_CODES`.
+    fn record(&mut self, code: Option<i32>, now_ms: u64) -> Option<u64> {
+        let has_overflow = self.buckets.contains_key(&None);
+        let key = if self.buckets.contains_key(&code)
+            || (code.is_some()
+                && self.buckets.len() + usize::from(!has_overflow) < Self::MAX_TRACKED_CODES)
+            || (code.is_none() && self.buckets.len() < Self::MAX_TRACKED_CODES)
+        {
+            code
+        } else {
+            None
+        };
+        match self.buckets.get_mut(&key) {
+            Some((last_ms, suppressed)) => {
+                if now_ms.saturating_sub(*last_ms) >= Self::MIN_INTERVAL_MS {
+                    let prev_suppressed = std::mem::take(suppressed);
+                    *last_ms = now_ms;
+                    Some(prev_suppressed)
+                } else {
+                    *suppressed = suppressed.saturating_add(1);
+                    None
+                }
+            }
+            None => {
+                self.buckets.insert(key, (now_ms, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+fn log_host_error(win32_error: Option<i32>, error_kind: io::ErrorKind, linux_errno: i32) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LIMITER: std::sync::OnceLock<Mutex<ErrorRateLimiter>> = std::sync::OnceLock::new();
+
+    let now_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let suppressed = LIMITER
+        .get_or_init(|| Mutex::new(ErrorRateLimiter::default()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .record(win32_error, now_ms);
+
+    if let Some(suppressed) = suppressed {
+        if let Some(code) = win32_error {
+            tracing::warn!(
+                win32_error = code,
+                linux_errno,
+                suppressed,
+                "windows passthroughfs host I/O error"
+            );
+        } else {
+            tracing::warn!(
+                error_kind = %error_kind,
+                linux_errno,
+                suppressed,
+                "windows passthroughfs host I/O error"
+            );
+        }
+    }
 }
 
 fn linux_error(errno: i32) -> io::Error {
