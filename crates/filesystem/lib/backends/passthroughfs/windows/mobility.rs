@@ -931,6 +931,7 @@ fn rebuild(
                 inode: saved.inode,
                 flags: saved.flags,
                 file: Mutex::new(file),
+                dirty: std::sync::atomic::AtomicBool::new(super::open_flags_write(saved.flags)),
             }),
         );
     }

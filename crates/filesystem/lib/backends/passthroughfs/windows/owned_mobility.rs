@@ -223,6 +223,9 @@ pub(super) fn prepare(fs: &PassthroughFs, bytes: &[u8]) -> io::Result<PreparedSt
                     inode: detached.inode,
                     flags: handle.flags,
                     file: Mutex::new(file),
+                    dirty: std::sync::atomic::AtomicBool::new(super::super::open_flags_write(
+                        handle.flags,
+                    )),
                 }),
             );
         }

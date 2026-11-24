@@ -3552,3 +3552,204 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
     .unwrap();
     assert!(seen.lock().unwrap().is_empty());
 }
+
+#[test]
+fn dirty_flag_tracks_writes_truncates_and_fsync() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("sample.txt"), b"initial").unwrap();
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"sample.txt").unwrap();
+
+    // Opening O_RDWR without O_TRUNC starts clean; flush is a no-op.
+    let (fh, _) = fs
+        .open(context(), entry.inode, false, LINUX_O_RDWR as u32)
+        .unwrap();
+    let fh = fh.unwrap();
+    assert!(
+        !fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.flush(context(), entry.inode, fh, 0).unwrap();
+    assert!(
+        !fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+
+    // Writing marks the handle dirty; flush clears it and persists bytes.
+    let mut reader = SourceReader {
+        bytes: b"updated!".to_vec(),
+        pos: 0,
+    };
+    let written = fs
+        .write(
+            context(),
+            entry.inode,
+            fh,
+            &mut reader,
+            8,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+    assert_eq!(written, 8);
+    assert!(
+        fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.flush(context(), entry.inode, fh, 0).unwrap();
+    assert!(
+        !fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    assert_eq!(std::fs::read(temp.path.join("sample.txt")).unwrap(), b"updated!");
+
+    // Writing then fsync also clears dirty.
+    let mut reader2 = SourceReader {
+        bytes: b"fsynced!".to_vec(),
+        pos: 0,
+    };
+    fs.write(
+        context(),
+        entry.inode,
+        fh,
+        &mut reader2,
+        8,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+    assert!(
+        fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.fsync(context(), entry.inode, true, fh).unwrap();
+    assert!(
+        !fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+
+    // setattr(SIZE) with handle marks the handle dirty; flush clears it.
+    fs.setattr(
+        context(),
+        entry.inode,
+        stat64 {
+            st_size: 4,
+            ..Default::default()
+        },
+        Some(fh),
+        SetattrValid::SIZE,
+    )
+    .unwrap();
+    assert!(
+        fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.flush(context(), entry.inode, fh, 0).unwrap();
+    assert!(
+        !fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+
+    // Handle-based set_times marks the handle dirty; flush clears it.
+    fs.setattr(
+        context(),
+        entry.inode,
+        stat64::default(),
+        Some(fh),
+        SetattrValid::MTIME_NOW,
+    )
+    .unwrap();
+    assert!(
+        fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.flush(context(), entry.inode, fh, 0).unwrap();
+    assert!(
+        !fs.handle(entry.inode, fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.release(context(), entry.inode, 0, fh, false, false, None)
+        .unwrap();
+
+    // Opening with O_TRUNC starts dirty.
+    let (trunc_fh, _) = fs
+        .open(
+            context(),
+            entry.inode,
+            false,
+            (LINUX_O_RDWR | LINUX_O_TRUNC) as u32,
+        )
+        .unwrap();
+    let trunc_fh = trunc_fh.unwrap();
+    assert!(
+        fs.handle(entry.inode, trunc_fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.flush(context(), entry.inode, trunc_fh, 0).unwrap();
+    assert!(
+        !fs.handle(entry.inode, trunc_fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.release(context(), entry.inode, 0, trunc_fh, false, false, None)
+        .unwrap();
+
+    // Creating a new file starts dirty.
+    let (created, created_fh, _) = fs
+        .create(
+            context(),
+            ROOT_INODE,
+            c"new.txt",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+    let created_fh = created_fh.unwrap();
+    assert!(
+        fs.handle(created.inode, created_fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.flush(context(), created.inode, created_fh, 0).unwrap();
+    assert!(
+        !fs.handle(created.inode, created_fh)
+            .unwrap()
+            .dirty
+            .load(Ordering::Acquire)
+    );
+    fs.release(context(), created.inode, 0, created_fh, false, false, None)
+        .unwrap();
+}

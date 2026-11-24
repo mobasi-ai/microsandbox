@@ -56,6 +56,7 @@ impl PassthroughFs {
                 inode: data.inode,
                 flags,
                 file: Mutex::new(file),
+                dirty: AtomicBool::new(true),
             }),
         );
 

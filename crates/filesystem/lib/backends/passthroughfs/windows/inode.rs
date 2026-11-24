@@ -40,6 +40,10 @@ pub(super) struct HandleData {
     pub(super) inode: u64,
     pub(super) flags: u32,
     pub(super) file: Mutex<File>,
+    /// Tracks whether this handle has unpersisted writes or truncation since
+    /// its last successful flush or fsync, so unmodified writable handles skip
+    /// `FlushFileBuffers` on close.
+    pub(super) dirty: AtomicBool,
 }
 
 pub(super) struct DirHandle {
