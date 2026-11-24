@@ -513,26 +513,47 @@ fn check_merged_dir_empty(
     }
 
     if let Some(other_inode) = dir_node.state.read().unwrap().backend_inode(other) {
+        // Snapshot whiteout names for this directory before backend I/O so whiteout
+        // writers never stall behind a slow directory listing.
+        let dir_whiteouts: std::collections::HashSet<Vec<u8>> = {
+            let whiteouts = fs.state.whiteouts.read().unwrap();
+            whiteouts
+                .iter()
+                .filter(|(p, _, b)| *p == dir_ino && *b == other)
+                .map(|(_, name, _)| name.clone())
+                .collect()
+        };
         let other_backend = backend(fs, other);
-        if let Ok((dh, _)) = other_backend.opendir(ctx, other_inode, 0) {
-            let dh_val = dh.unwrap_or(0);
-            if let Ok(entries) = other_backend.readdir(ctx, other_inode, dh_val, u32::MAX, 0) {
-                let whiteouts = fs.state.whiteouts.read().unwrap();
-                for entry in &entries {
-                    let name = entry.name.to_vec();
-                    if name == b"." || name == b".." {
-                        continue;
-                    }
-                    if dir_ino == ROOT_INODE && name == STAGING_DIR_NAME {
-                        continue;
-                    }
-                    if !whiteouts.contains(&(dir_ino, name, other)) {
-                        let _ = other_backend.releasedir(ctx, other_inode, 0, dh_val);
-                        return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
-                    }
+        let dh = match other_backend.opendir(ctx, other_inode, 0) {
+            Ok((dh, _)) => dh.unwrap_or(0),
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let mut non_empty = false;
+        let list_result = other_backend.readdir_for_each(
+            ctx,
+            other_inode,
+            dh,
+            u32::MAX,
+            0,
+            &mut |entry| {
+                if entry.name == b"." || entry.name == b".." {
+                    return Ok(1);
                 }
-            }
-            let _ = other_backend.releasedir(ctx, other_inode, 0, dh_val);
+                if dir_ino == ROOT_INODE && entry.name == STAGING_DIR_NAME {
+                    return Ok(1);
+                }
+                if !dir_whiteouts.contains(entry.name) {
+                    non_empty = true;
+                    return Ok(0);
+                }
+                Ok(1)
+            },
+        );
+        let _ = other_backend.releasedir(ctx, other_inode, 0, dh);
+        list_result?;
+        if non_empty {
+            return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
     }
 

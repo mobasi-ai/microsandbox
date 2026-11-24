@@ -1,6 +1,6 @@
 //! DynFileSystem callback table for the Windows passthrough backend.
 
-use super::dir_ops::snapshot_dir_entry;
+use super::dir_ops::{borrowed_dir_entry, snapshot_dir_entry};
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
@@ -475,12 +475,9 @@ impl DynFileSystem for PassthroughFs {
         _size: u32,
         offset: u64,
     ) -> io::Result<Vec<DirEntry<'static>>> {
-        Ok(self
-            .dir_snapshot(inode, handle)?
-            .into_iter()
-            .filter(|entry| entry.offset > offset)
-            .map(snapshot_dir_entry)
-            .collect())
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        Ok(snapshot[start..].iter().map(snapshot_dir_entry).collect())
     }
 
     fn readdir_for_each(
@@ -492,8 +489,10 @@ impl DynFileSystem for PassthroughFs {
         offset: u64,
         add_entry: &mut AddDirEntry<'_>,
     ) -> io::Result<()> {
-        for entry in self.dir_snapshot(inode, handle)? {
-            if entry.offset > offset && add_entry(snapshot_dir_entry(entry))? == 0 {
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        for entry in &snapshot[start..] {
+            if add_entry(borrowed_dir_entry(entry))? == 0 {
                 break;
             }
         }
@@ -508,17 +507,19 @@ impl DynFileSystem for PassthroughFs {
         _size: u32,
         offset: u64,
     ) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
-        let entries = self
-            .dir_snapshot(inode, handle)?
-            .into_iter()
-            .filter(|entry| entry.offset > offset)
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        let entries = snapshot[start..]
+            .iter()
             .map(|entry| {
-                let full = self.snapshot_entry_attributes(&entry)?;
+                let full = self.snapshot_entry_attributes(entry)?;
                 Ok((snapshot_dir_entry(entry), full))
             })
             .collect::<io::Result<Vec<_>>>()?;
-        for (_, entry) in &entries {
-            self.record_owned_lookup(entry.inode);
+        for (dir_entry, entry) in &entries {
+            if dir_entry.name != b"." && dir_entry.name != b".." {
+                self.record_owned_lookup(entry.inode);
+            }
         }
         Ok(entries)
     }
@@ -532,16 +533,17 @@ impl DynFileSystem for PassthroughFs {
         offset: u64,
         add_entry: &mut AddDirEntryPlus<'_>,
     ) -> io::Result<()> {
-        for entry in self.dir_snapshot(inode, handle)? {
-            if entry.offset <= offset {
-                continue;
-            }
-            let full = self.snapshot_entry_attributes(&entry)?;
+        let snapshot = self.dir_snapshot(inode, handle)?;
+        let start = snapshot.partition_point(|entry| entry.offset <= offset);
+        for entry in &snapshot[start..] {
+            let full = self.snapshot_entry_attributes(entry)?;
             let id = full.inode;
-            if add_entry(snapshot_dir_entry(entry), full)? == 0 {
+            if add_entry(borrowed_dir_entry(entry), full)? == 0 {
                 break;
             }
-            self.record_owned_lookup(id);
+            if entry.name != b"." && entry.name != b".." {
+                self.record_owned_lookup(id);
+            }
         }
         Ok(())
     }
