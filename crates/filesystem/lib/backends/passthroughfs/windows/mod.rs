@@ -127,9 +127,27 @@ const RENAME_EXCHANGE: u32 = 2;
 const RENAME_WHITEOUT: u32 = 4;
 
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+const FILE_TRAVERSE: u32 = 0x0000_0020;
+const FILE_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+const NT_SYNCHRONIZE: u32 = 0x0010_0000;
+const NT_FILE_OPEN: u32 = 0x0000_0001;
+const NT_FILE_CREATE: u32 = 0x0000_0002;
+const NT_FILE_OPEN_IF: u32 = 0x0000_0003;
+const NT_FILE_CREATED: usize = 2;
+const NT_FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const NT_FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+const NT_FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const NT_FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+const NT_FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const NT_OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+const FILE_INVALID_FILE_ID: u64 = u64::MAX;
 
 const ERROR_FILE_NOT_FOUND: i32 = 2;
 const ERROR_PATH_NOT_FOUND: i32 = 3;
@@ -155,6 +173,15 @@ const OVERRIDE_SIZE: usize = std::mem::size_of::<OverrideStat>();
 pub struct PassthroughFs {
     cfg: PassthroughConfig,
     root: PathBuf,
+    /// Verified directory handle opened once at mount time so handle-relative traversal
+    /// (`NtCreateFile`) always anchors to the original mounted root object without reopening
+    /// `root` by pathname. Opened without `FILE_SHARE_DELETE` when uncontended so Windows
+    /// prevents `root` and its ancestors from being renamed or replaced while mounted.
+    root_handle: File,
+    /// Normalized NT device path of `root` (without a trailing `\`), populated only when
+    /// `root_handle` is pinned against deletion/rename so the fast-path exact UTF-16 prefix
+    /// check cannot be invalidated by root replacement.
+    root_nt_path: Option<Vec<u16>>,
     inodes: RwLock<InodeTable>,
     next_inode: AtomicU64,
     handles: RwLock<BTreeMap<u64, Arc<HandleData>>>,
@@ -225,19 +252,26 @@ impl PassthroughFs {
         mobility::prepare_single_file_state(bytes, source, destination, limit)
     }
 
-    /// Charge the quota for growing from `old_len` to `new_end` bytes.
-    pub(super) fn quota_charge_growth(&self, old_len: u64, new_end: u64) -> io::Result<()> {
+    /// Charge the quota for growing from `old_len` to `new_end` bytes and hold the
+    /// reservation until the caller's host mutation completes.
+    pub(super) fn quota_charge_growth(
+        &self,
+        old_len: u64,
+        new_end: u64,
+    ) -> io::Result<Option<super::quota::QuotaReservation<'_>>> {
         if let Some(quota) = &self.quota {
-            quota.charge(new_end.saturating_sub(old_len))?;
+            return quota.reserve(new_end.saturating_sub(old_len)).map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
-    /// Charge the quota for growing an open file to `new_end` bytes.
-    ///
-    /// Used on create-like paths where the file was just created and the
-    /// handle metadata is enough to determine growth before bytes are written.
-    pub(super) fn quota_charge_file_to(&self, file: &File, new_end: u64) -> io::Result<()> {
+    /// Charge the quota for growing an open file to `new_end` bytes and hold the
+    /// reservation until the caller's host mutation completes.
+    pub(super) fn quota_charge_file_to(
+        &self,
+        file: &File,
+        new_end: u64,
+    ) -> io::Result<Option<super::quota::QuotaReservation<'_>>> {
         self.quota_charge_growth(super::quota::file_size(file), new_end)
     }
 
@@ -265,6 +299,7 @@ fn validate_component(name: &CStr) -> io::Result<&str> {
         || component.contains('\\')
         || component.contains(':')
         || is_reserved_name(component)
+        || is_windows_device_name(component)
     {
         return Err(linux_error(LINUX_EPERM));
     }
@@ -272,8 +307,455 @@ fn validate_component(name: &CStr) -> io::Result<&str> {
     Ok(component)
 }
 
+fn is_windows_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or_default().trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    let numbered = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        });
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered
+}
+
 fn is_reserved_name(component: &str) -> bool {
     component.eq_ignore_ascii_case(FALLBACK_METADATA_DIR_NAME)
+}
+
+/// Filter out Windows/SMB sentinel file IDs (`0` and `u64::MAX` / `FILE_INVALID_FILE_ID`)
+/// so filesystems without stable 64-bit IDs never alias unrelated files into one guest inode.
+pub(super) fn valid_file_identity(volume_serial: u32, file_index: u64) -> Option<(u32, u64)> {
+    (file_index != 0 && file_index != FILE_INVALID_FILE_ID).then_some((volume_serial, file_index))
+}
+
+/// Host file metadata, link count, and volume/file identity collected in a single
+/// Win32 handle query or batched directory-enumeration entry.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WinFileInfo {
+    pub(super) file_attributes: u32,
+    pub(super) creation_time: u64,
+    pub(super) last_access_time: u64,
+    pub(super) last_write_time: u64,
+    pub(super) file_size: u64,
+    pub(super) nlink: u64,
+    pub(super) identity: Option<(u32, u64)>,
+}
+
+impl WinFileInfo {
+    pub(super) fn from_handle(file: &File) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns the live handle and `info` has the exact Win32 ABI layout.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(host_error(io::Error::last_os_error()));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(linux_error(LINUX_ELOOP));
+        }
+
+        let filetime = |ft: windows_sys::Win32::Foundation::FILETIME| -> u64 {
+            (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+        };
+        let file_index =
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        let file_size =
+            (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+
+        Ok(Self {
+            file_attributes: info.dwFileAttributes,
+            creation_time: filetime(info.ftCreationTime),
+            last_access_time: filetime(info.ftLastAccessTime),
+            last_write_time: filetime(info.ftLastWriteTime),
+            file_size,
+            nlink: u64::from(info.nNumberOfLinks),
+            identity: valid_file_identity(info.dwVolumeSerialNumber, file_index),
+        })
+    }
+
+    pub(super) fn is_dir(&self) -> bool {
+        self.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    pub(super) fn mode(&self) -> u32 {
+        let type_bits = if self.is_dir() { S_IFDIR } else { S_IFREG };
+        let perms = if self.file_attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            0o555
+        } else {
+            0o777
+        };
+        type_bits | perms
+    }
+
+    pub(super) fn to_host_stat(self, inode: u64) -> stat64 {
+        let (atime, atime_nsec) = filetime_to_unix(self.last_access_time);
+        let (mtime, mtime_nsec) = filetime_to_unix(self.last_write_time);
+        let (ctime, ctime_nsec) = filetime_to_unix(self.creation_time);
+
+        stat64 {
+            st_ino: inode,
+            st_size: self.file_size as i64,
+            st_blocks: blocks_for_size(self.file_size),
+            st_atime: atime,
+            st_mtime: mtime,
+            st_ctime: ctime,
+            st_atime_nsec: atime_nsec,
+            st_mtime_nsec: mtime_nsec,
+            st_ctime_nsec: ctime_nsec,
+            st_mode: self.mode(),
+            st_nlink: self.nlink,
+            st_uid: 0,
+            st_gid: 0,
+            st_rdev: 0,
+            st_blksize: 4096,
+        }
+    }
+}
+
+/// Validate `path` lexically under `root` in memory (no host I/O), returning its normal
+/// relative components. Rejects `..`, non-normal components, reserved metadata names, and
+/// Windows reserved device names.
+fn lexical_relative_under_root<'a>(
+    root: &Path,
+    path: &'a Path,
+) -> io::Result<Vec<&'a std::ffi::OsStr>> {
+    ensure_lexically_under_root(root, path)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| linux_error(LINUX_EACCES))?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                if part
+                    .to_str()
+                    .is_some_and(|s| is_reserved_name(s) || is_windows_device_name(s))
+                {
+                    return Err(linux_error(LINUX_EPERM));
+                }
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            _ => return Err(linux_error(LINUX_EACCES)),
+        }
+    }
+    Ok(parts)
+}
+
+/// Query the normalized NT device path (`\Device\...`) of an open handle, with any trailing
+/// backslashes stripped so bare volume roots and subdirectories compare uniformly.
+/// Loops if a concurrent rename lengthens the path between buffer-sizing attempts.
+fn final_nt_path_by_handle(file: &File) -> io::Result<Vec<u16>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_NT,
+    };
+
+    const FLAGS: u32 = VOLUME_NAME_NT | FILE_NAME_NORMALIZED;
+    let mut stack = [0u16; 512];
+    // SAFETY: `file` owns the handle and `stack` is a valid writable UTF-16 buffer.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(file.as_raw_handle(), stack.as_mut_ptr(), stack.len() as u32, FLAGS)
+    };
+    if len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut out = if (len as usize) < stack.len() {
+        stack[..len as usize].to_vec()
+    } else {
+        let mut capacity = len as usize;
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            if attempts > 8 {
+                return Err(io::Error::other("final path kept growing"));
+            }
+            let mut heap = vec![0u16; capacity];
+            // SAFETY: `heap` has room for `capacity` UTF-16 code units.
+            let written = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle(),
+                    heap.as_mut_ptr(),
+                    heap.len() as u32,
+                    FLAGS,
+                )
+            };
+            if written == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (written as usize) < heap.len() {
+                heap.truncate(written as usize);
+                break heap;
+            }
+            // Buffer was still too small (path grew concurrently); resize to returned length.
+            capacity = written as usize;
+        }
+    };
+    while out.last() == Some(&(b'\\' as u16)) {
+        out.pop();
+    }
+    Ok(out)
+}
+
+fn open_root_anchor(root: &Path) -> io::Result<(File, Option<Vec<u16>>)> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+    // Prefer pinning `root` without `FILE_SHARE_DELETE` so Windows guarantees `root` and
+    // its ancestors cannot be renamed or replaced while mounted. If another host process
+    // already holds `DELETE` access, fall back to `FILE_SHARE_ALL` and disable the pathname
+    // fast path (`root_nt_path = None`) so every lookup walks directly from `root_handle`.
+    let (file, pinned_against_delete) = match StdOpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)
+    {
+        Ok(file) => (file, true),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            let file = StdOpenOptions::new()
+                .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+                .share_mode(FILE_SHARE_ALL)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(root)
+                .map_err(host_error)?;
+            (file, false)
+        }
+        Err(error) => return Err(host_error(error)),
+    };
+    let info = WinFileInfo::from_handle(&file)?;
+    if !info.is_dir() {
+        return Err(linux_error(LINUX_ENOTDIR));
+    }
+    let root_nt_path = if pinned_against_delete {
+        final_nt_path_by_handle(&file).ok()
+    } else {
+        None
+    };
+    Ok((file, root_nt_path))
+}
+
+/// Re-open an existing verified kernel object handle with fresh access/share flags and an
+/// independent file pointer, without touching the filesystem namespace.
+pub(super) fn reopen_file_handle(
+    file: &File,
+    desired_access: u32,
+    share_access: u32,
+    flags: u32,
+) -> io::Result<File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
+
+    // SAFETY: `file` owns a live handle and `ReOpenFile` returns either `INVALID_HANDLE_VALUE`
+    // or a fresh owned handle on the same kernel file object.
+    let raw = unsafe { ReOpenFile(file.as_raw_handle(), desired_access, share_access, flags) };
+    if raw == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(host_error(io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_handle(raw) })
+}
+
+/// Exact UTF-16 prefix check (no case folding, so distinct case-sensitive NTFS sibling
+/// directories can never be conflated with `root_nt`).
+fn nt_path_under_root(final_path: &[u16], root_nt: &[u16]) -> bool {
+    if final_path.len() < root_nt.len() {
+        return false;
+    }
+    if final_path[..root_nt.len()] != *root_nt {
+        return false;
+    }
+    final_path.len() == root_nt.len() || final_path[root_nt.len()] == b'\\' as u16
+}
+
+/// Check that `final_path` equals `root_nt + "\" + rel_parts` byte-for-byte in UTF-16 and
+/// contains no reserved metadata component (blocking 8.3 short-name aliases because
+/// `FILE_NAME_NORMALIZED` expands them back to the long name).
+fn nt_path_matches_expected(
+    final_path: &[u16],
+    root_nt: &[u16],
+    rel_parts: &[&std::ffi::OsStr],
+) -> bool {
+    if !nt_path_under_root(final_path, root_nt) {
+        return false;
+    }
+    let mut cursor = root_nt.len();
+    for part in rel_parts {
+        if cursor >= final_path.len() || final_path[cursor] != b'\\' as u16 {
+            return false;
+        }
+        cursor += 1;
+        let seg_start = cursor;
+        for unit in part.encode_wide() {
+            if cursor >= final_path.len() || final_path[cursor] != unit {
+                return false;
+            }
+            cursor += 1;
+        }
+        let seg = OsString::from_wide(&final_path[seg_start..cursor]);
+        if seg.to_str().is_some_and(is_reserved_name) {
+            return false;
+        }
+    }
+    cursor == final_path.len()
+}
+
+/// Reject a handle whose kernel-normalized long filename resolves to the hidden metadata
+/// directory or a Windows device name (blocks 8.3 short-name aliases such as `MSB_OV~1` ->
+/// `.msb_override_stat`). Fails closed if the kernel cannot report the normalized name.
+fn reject_reserved_resolved_name(file: &File) -> io::Result<()> {
+    let final_nt = final_nt_path_by_handle(file).map_err(host_error)?;
+    let last_start = final_nt
+        .iter()
+        .rposition(|&unit| unit == b'\\' as u16)
+        .map_or(0, |pos| pos + 1);
+    let last = OsString::from_wide(&final_nt[last_start..]);
+    if last
+        .to_str()
+        .is_some_and(|name| is_reserved_name(name) || is_windows_device_name(name))
+    {
+        return Err(linux_error(LINUX_EPERM));
+    }
+    Ok(())
+}
+
+/// Open a single direct child component relative to an already-verified parent directory
+/// handle using `NtCreateFile` with `FILE_OPEN_REPARSE_POINT`, guaranteeing no intermediate
+/// pathname traversal or symlink/junction follow can occur.
+fn nt_open_relative(
+    parent_dir: &File,
+    component: &std::ffi::OsStr,
+    desired_access: u32,
+    share_access: u32,
+    extra_options: u32,
+) -> io::Result<File> {
+    nt_create_relative(
+        parent_dir,
+        component,
+        desired_access,
+        share_access,
+        NT_FILE_OPEN,
+        0,
+        extra_options,
+    )
+    .map(|(file, _)| file)
+}
+
+/// Open or create a single direct child component relative to an already-verified parent
+/// directory handle using `NtCreateFile(RootDirectory, FILE_OPEN_REPARSE_POINT)`.
+/// Returns `(file, created_new)` where `created_new` is true only when the kernel created
+/// a new file (`FILE_CREATED`).
+fn nt_create_relative(
+    parent_dir: &File,
+    component: &std::ffi::OsStr,
+    desired_access: u32,
+    share_access: u32,
+    create_disposition: u32,
+    file_attributes: u32,
+    extra_options: u32,
+) -> io::Result<(File, bool)> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: i32,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    let mut wide: Vec<u16> = component.encode_wide().collect();
+    let byte_len = u16::try_from(wide.len().saturating_mul(2))
+        .map_err(|_| linux_error(LINUX_EINVAL))?;
+    let mut name = UnicodeString {
+        length: byte_len,
+        maximum_length: byte_len,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: parent_dir.as_raw_handle(),
+        object_name: &mut name,
+        attributes: NT_OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw_handle: HANDLE = std::ptr::null_mut();
+    let create_options = NT_FILE_OPEN_REPARSE_POINT
+        | NT_FILE_OPEN_FOR_BACKUP_INTENT
+        | NT_FILE_SYNCHRONOUS_IO_NONALERT
+        | extra_options;
+
+    // SAFETY: all pointers (`raw_handle`, `attrs`, `name`, `wide`, `iosb`) are valid and
+    // remain alive for the synchronous `NtCreateFile` call.
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw_handle,
+            desired_access | NT_SYNCHRONIZE,
+            &mut attrs,
+            &mut iosb,
+            std::ptr::null_mut(),
+            file_attributes,
+            share_access,
+            create_disposition,
+            create_options,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: `RtlNtStatusToDosError` takes any NTSTATUS value and returns a Win32 code.
+        let dos = unsafe { RtlNtStatusToDosError(status) };
+        return Err(host_error(io::Error::from_raw_os_error(dos as i32)));
+    }
+    // SAFETY: `NtCreateFile` succeeded (`status >= 0`) and wrote a valid owned handle.
+    Ok((
+        unsafe { File::from_raw_handle(raw_handle) },
+        iosb.information == NT_FILE_CREATED,
+    ))
 }
 
 fn ensure_lexically_under_root(root: &Path, path: &Path) -> io::Result<()> {
@@ -284,17 +766,13 @@ fn ensure_lexically_under_root(root: &Path, path: &Path) -> io::Result<()> {
     }
 }
 
-/// Resolve the mount root trusting no component of the provided path.
-///
-/// Walks `root_dir` from the volume root, rejecting a reparse point (symlink or
-/// junction) at every component and refusing `..`, so neither a planted reparse
-/// point nor an injected `..` can move the mount off its intended target. The
-/// only implicitly trusted object is the volume root (e.g. `C:\`), which cannot
-/// be a reparse point. Each component is checked with a non-following
-/// `symlink_metadata` only after its ancestors are verified clean, so path
-/// resolution never crosses a reparse point. Unlike `canonicalize`, this never
-/// follows a reparse point out of the intended subtree.
-fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<PathBuf> {
+/// Resolve the mount root trusting no component of the provided path, returning the
+/// resolved path, the live pinned directory handle from the walk, and its normalized NT
+/// path (when pinned against delete/rename), so the constructor never reopens `root` by
+/// pathname.
+fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<(PathBuf, File, Option<Vec<u16>>)> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
     // Reject `..` from the RAW path string, not from `Path::components()`.
     //
     // For verbatim (`\\?\`) paths, `components()` collapses `a\..` lexically
@@ -329,22 +807,59 @@ fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<PathBuf> {
         cursor.push(".");
     }
 
-    // Descend one component at a time; each ancestor is verified non-reparse
-    // before the next lookup, so resolution never follows a reparse point.
-    for name in &names {
+    if names.is_empty() {
+        let (handle, nt_path) = open_root_anchor(&cursor)?;
+        return Ok((cursor, handle, nt_path));
+    }
+
+    let mut current = StdOpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&cursor)
+        .map_err(host_error)?;
+    let base_info = WinFileInfo::from_handle(&current)?;
+    if !base_info.is_dir() {
+        return Err(linux_error(LINUX_ENOTDIR));
+    }
+
+    // Descend one component at a time via `NtCreateFile(RootDirectory, FILE_OPEN_REPARSE_POINT)`;
+    // pin the final root directory without `FILE_SHARE_DELETE` so Windows prevents the mount
+    // root and its ancestors from being renamed or replaced during `StatStore::new` or later.
+    let last_index = names.len() - 1;
+    for (idx, name) in names.iter().enumerate() {
         if name.to_str().is_some_and(is_reserved_name) {
             return Err(linux_error(LINUX_EPERM));
         }
+        let is_last = idx == last_index;
+        let next = if is_last {
+            nt_open_relative(
+                &current,
+                name,
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                FILE_SHARE_READ_WRITE,
+                0,
+            )?
+        } else {
+            nt_open_relative(
+                &current,
+                name,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                FILE_SHARE_ALL,
+                0,
+            )?
+        };
+        let next_info = WinFileInfo::from_handle(&next)?;
+        reject_reserved_resolved_name(&next)?;
+        if !next_info.is_dir() {
+            return Err(linux_error(LINUX_ENOTDIR));
+        }
         cursor.push(name);
-        let metadata = std::fs::symlink_metadata(&cursor).map_err(host_error)?;
-        reject_reparse_metadata(&metadata)?;
+        current = next;
     }
 
-    let metadata = std::fs::symlink_metadata(&cursor).map_err(host_error)?;
-    if !metadata.file_type().is_dir() {
-        return Err(linux_error(LINUX_ENOTDIR));
-    }
-    Ok(cursor)
+    let root_nt_path = final_nt_path_by_handle(&current).ok();
+    Ok((cursor, current, root_nt_path))
 }
 
 fn safe_metadata_under_root(root: &Path, path: &Path) -> io::Result<std::fs::Metadata> {

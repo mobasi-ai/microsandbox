@@ -147,18 +147,14 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_EINVAL));
         }
 
-        let root = if cfg.no_symlink_root {
-            // Resolve without following any reparse point; nothing in the path
-            // is trusted, so the escaping-symlink-root vector is closed.
+        let (root, root_handle, root_nt_path) = if cfg.no_symlink_root {
+            // Walk from the volume root via handle-relative NtCreateFile and pin
+            // the resulting directory handle directly (zero pathname reopen).
             resolve_root_no_reparse(&cfg.root_dir)?
         } else {
             let root = std::fs::canonicalize(&cfg.root_dir).map_err(host_error)?;
-            let metadata = std::fs::symlink_metadata(&root).map_err(host_error)?;
-            reject_reparse_metadata(&metadata)?;
-            if !metadata.file_type().is_dir() {
-                return Err(linux_error(LINUX_ENOTDIR));
-            }
-            root
+            let (root_handle, root_nt_path) = open_root_anchor(&root)?;
+            (root, root_handle, root_nt_path)
         };
         let probe_path = probe_name
             .map(|name| std::str::from_utf8(name.to_bytes()).map(|name| root.join(name)))
@@ -190,6 +186,8 @@ impl PassthroughFs {
         Ok(Self {
             cfg,
             root,
+            root_handle,
+            root_nt_path,
             inodes: RwLock::new(InodeTable::default()),
             next_inode: AtomicU64::new(INIT_INODE + 1),
             handles: RwLock::new(BTreeMap::new()),

@@ -22,18 +22,14 @@ impl PassthroughFs {
         }
 
         let data = self.inode(inode)?;
-        let metadata = self.inode_metadata(&data)?;
-        if metadata.file_type().is_dir() {
-            return Err(linux_error(LINUX_EISDIR));
+        // Atomically re-open either the pinned retained handle (without releasing the
+        // retained lock across a fallback) or a verified non-truncating handle under root,
+        // then acquire the DAX lock on THAT exact handle before truncating.
+        let (file, _info) = self.open_verified_inode_file(&data, flags)?;
+        if flags & LINUX_O_TRUNC as u32 != 0 {
+            let state = self.dax_files.get(&file)?;
+            self.with_file_mappings_suspended(&state, || file.set_len(0).map_err(host_error))?;
         }
-
-        let file = if flags & LINUX_O_TRUNC as u32 != 0 {
-            self.resize_inode(inode, || self.open_inode_file(&data, flags))?
-        } else {
-            self.open_inode_file(&data, flags)?
-        };
-
-        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
         if kill_priv && flags as i32 & LINUX_O_TRUNC != 0 {
             self.clear_priv_bits(data.as_ref())?;
         }
@@ -50,43 +46,98 @@ impl PassthroughFs {
         Ok((Some(handle), OpenOptions::empty()))
     }
 
-    pub(super) fn open_inode_file(&self, data: &InodeData, flags: u32) -> io::Result<File> {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
+    /// Atomically re-open an inode's pinned retained handle while holding `data.retained`.
+    /// Never falls back to a pathname open and never truncates.
+    fn try_reopen_retained(&self, data: &InodeData, desired_access: u32) -> Option<io::Result<File>> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 
         let retained = data.retained.lock().unwrap();
-        if let Some(file) = retained.as_ref() {
-            let access = if open_flags_readable(flags) {
-                0x8000_0000
-            } else {
-                0
-            } | if open_flags_writable(flags) {
-                0x4000_0000
-            } else {
-                0
-            };
-            // ReOpenFile gives an independent file pointer and preserves the pinned object,
-            // even when its old path has been reused by a different file.
-            let raw = unsafe {
-                ReOpenFile(
-                    file.as_raw_handle(),
-                    access,
-                    7,
-                    FILE_FLAG_OPEN_REPARSE_POINT,
-                )
-            };
-            if raw == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                return Err(host_error(io::Error::last_os_error()));
-            }
-            let reopened = unsafe { File::from_raw_handle(raw) };
-            if flags & LINUX_O_TRUNC as u32 != 0 {
-                reopened.set_len(0).map_err(host_error)?;
-            }
-            Ok(reopened)
-        } else {
-            open_options_from_flags(flags, false)?
-                .open(data.path())
-                .map_err(host_error)
-        }
+        let file = retained.as_ref()?;
+        Some(reopen_file_handle(
+            file,
+            desired_access | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        ))
     }
+
+    /// Open `data` with explicit Win32 desired access without truncating, verifying root
+    /// confinement, non-reparse status, file type, and cached file identity (`ESTALE`).
+    pub(super) fn open_verified_inode_file_access(
+        &self,
+        data: &InodeData,
+        desired_access: u32,
+        allow_dir: bool,
+    ) -> io::Result<(File, WinFileInfo)> {
+        if let Some(reopened) = self.try_reopen_retained(data, desired_access) {
+            let file = reopened?;
+            let info = WinFileInfo::from_handle(&file)?;
+            if !allow_dir && info.is_dir() {
+                return Err(linux_error(LINUX_EISDIR));
+            }
+            return Ok((file, info));
+        }
+
+        let (file, info) =
+            self.open_verified_handle(&data.path(), desired_access, FILE_SHARE_ALL, 0)?;
+        if !allow_dir && info.is_dir() {
+            return Err(linux_error(LINUX_EISDIR));
+        }
+        if let (Some(expected), Some(actual)) = (data.identity, info.identity)
+            && expected != actual
+        {
+            return Err(linux_error(LINUX_ESTALE));
+        }
+        Ok((file, info))
+    }
+
+    /// Open `data` using Linux open flags (always stripping `O_TRUNC` so callers truncate
+    /// only after verification and DAX suspension).
+    pub(super) fn open_verified_inode_file(
+        &self,
+        data: &InodeData,
+        flags: u32,
+    ) -> io::Result<(File, WinFileInfo)> {
+        let desired_access = access_mask_from_open_flags(flags)?;
+        self.open_verified_inode_file_access(data, desired_access, false)
+    }
+}
+
+/// Map Linux `open(2)` flags (without `O_CREAT`/`O_TRUNC`) to a Win32 desired-access mask
+/// suitable for both `StdOpenOptions::access_mode` and `NtCreateFile`.
+pub(super) fn access_mask_from_open_flags(flags: u32) -> io::Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_APPEND_DATA, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_WRITE_ATTRIBUTES,
+    };
+
+    let flags = flags as i32;
+    if flags & LINUX_O_DIRECT != 0 {
+        return Err(linux_error(LINUX_EOPNOTSUPP));
+    }
+    if flags & (LINUX_O_CREAT | LINUX_O_EXCL) != 0 {
+        return Err(linux_error(LINUX_EINVAL));
+    }
+    if flags & LINUX_O_DIRECTORY != 0 {
+        return Err(linux_error(LINUX_EISDIR));
+    }
+
+    let accmode = flags & LINUX_O_ACCMODE;
+    if flags & LINUX_O_TRUNC != 0 && accmode == 0 {
+        return Err(linux_error(LINUX_EACCES));
+    }
+    let append_only = flags & LINUX_O_APPEND != 0 && flags & LINUX_O_TRUNC == 0;
+    let mask = match accmode {
+        0 => FILE_GENERIC_READ,
+        LINUX_O_WRONLY if append_only => {
+            FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | NT_SYNCHRONIZE
+        }
+        LINUX_O_WRONLY => FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+        LINUX_O_RDWR if append_only => {
+            FILE_GENERIC_READ | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
+        }
+        LINUX_O_RDWR => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+        _ => return Err(linux_error(LINUX_EINVAL)),
+    };
+    Ok(mask)
 }

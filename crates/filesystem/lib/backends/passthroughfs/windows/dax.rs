@@ -221,13 +221,14 @@ impl PassthroughFs {
     /// Windows requires all host views to be closed before SetEndOfFile. Keep
     /// each guest slot's file identity and offsets while withdrawing its backing,
     /// then restore the slots at the resulting size even if the operation fails.
+    #[cfg(test)]
     pub(super) fn resize_inode<T>(
         &self,
         inode: u64,
         resize: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
         let data = self.inode(inode)?;
-        let file = self.open_inode_file(&data, LINUX_O_WRONLY as u32)?;
+        let (file, _) = self.open_verified_inode_file(&data, LINUX_O_WRONLY as u32)?;
         let state = self.dax_files.get(&file)?;
         self.with_file_mappings_suspended(&state, resize)
     }
@@ -295,13 +296,7 @@ impl PassthroughFs {
         } else {
             0
         };
-        let file = self.open_inode_file(data, flags)?;
-        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
-        if let Some(expected) = data.identity
-            && mobility::file_identity(&file).map_err(host_error)? != expected
-        {
-            return Err(linux_error(LINUX_ESTALE));
-        }
+        let (file, _) = self.open_verified_inode_file(data, flags)?;
         Ok(file)
     }
 }

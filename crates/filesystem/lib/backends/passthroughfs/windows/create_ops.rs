@@ -17,35 +17,73 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
         self.require_writable()?;
+        let component = validate_component(name)?;
         let path = self.child_path(parent, name)?;
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
-        let parent_metadata = self.safe_metadata(parent_path)?;
-        if !parent_metadata.file_type().is_dir() {
+        let (parent_file, parent_info) = self.open_verified_handle(
+            parent_path,
+            windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            FILE_SHARE_ALL,
+            NT_FILE_DIRECTORY_FILE,
+        )?;
+        if !parent_info.is_dir() {
             return Err(linux_error(LINUX_ENOTDIR));
         }
 
         self.quota_ensure_baseline();
 
-        let options = open_options_from_flags(flags, true)?;
-        let file = if flags & LINUX_O_TRUNC as u32 != 0 && self.safe_metadata(&path).is_ok() {
-            let data = self.intern_path(path.clone())?;
-            self.resize_inode(data.inode, || options.open(&path).map_err(host_error))?
+        // Validate full Linux flags first (e.g., O_DIRECT, O_RDONLY|O_TRUNC), then create/open
+        // the child directly relative to the verified `parent_file` handle (`RootDirectory`)
+        // without truncating, so neither a swapped parent nor a planted reparse point can create
+        // or truncate a file outside the mount.
+        let _ = open_options_from_flags(flags, true)?;
+        let wants_trunc = flags & LINUX_O_TRUNC as u32 != 0;
+        let access_flags = if wants_trunc {
+            flags & !(LINUX_O_CREAT as u32 | LINUX_O_EXCL as u32 | LINUX_O_APPEND as u32)
         } else {
-            options.open(&path).map_err(host_error)?
+            flags & !(LINUX_O_CREAT as u32 | LINUX_O_EXCL as u32)
         };
+        let desired_access = file_ops::access_mask_from_open_flags(access_flags)?;
+        let disposition = if flags as i32 & LINUX_O_EXCL != 0 {
+            NT_FILE_CREATE
+        } else {
+            NT_FILE_OPEN_IF
+        };
+        let (file, created_new) = nt_create_relative(
+            &parent_file,
+            std::ffi::OsStr::new(component),
+            desired_access | windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            disposition,
+            FILE_ATTRIBUTE_NORMAL,
+            NT_FILE_NON_DIRECTORY_FILE,
+        )?;
 
-        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
-        let metadata = self.safe_metadata(&path)?;
-        let data = self.intern_path(path.clone())?;
-        if let Err(error) = self.set_virtual_metadata(
+        let mut info = WinFileInfo::from_handle(&file)?;
+        if info.is_dir() {
+            return Err(linux_error(LINUX_EISDIR));
+        }
+        reject_reserved_resolved_name(&file)?;
+        if wants_trunc {
+            let state = self.dax_files.get(&file)?;
+            self.with_file_mappings_suspended(&state, || file.set_len(0).map_err(host_error))?;
+            info = WinFileInfo::from_handle(&file)?;
+        }
+
+        let data = self.intern_path_with_identity(path.clone(), info.identity)?;
+        let target_mode = (info.mode() & S_IFMT) | (mode & !umask & 0o7777);
+        if let Err(error) = self.set_virtual_metadata_with_handle(
             data.as_ref(),
+            Some(&file),
             ctx.uid,
             ctx.gid,
-            (mode_from_metadata(&metadata) & S_IFMT) | (mode & !umask & 0o7777),
+            target_mode,
             0,
         ) {
-            let _ = std::fs::remove_file(&path);
-            self.remove_inode_path(&path);
+            if created_new {
+                let _ = std::fs::remove_file(&path);
+                self.remove_inode_path(&path);
+            }
             return Err(error);
         }
 
@@ -61,7 +99,7 @@ impl PassthroughFs {
         );
 
         Ok((
-            self.entry_from_metadata(&metadata, data.as_ref())?,
+            self.entry_from_file_info(&info, data.as_ref())?,
             Some(handle),
             OpenOptions::empty(),
         ))
@@ -140,10 +178,14 @@ impl PassthroughFs {
             .open(&path)
             .map_err(host_error)?;
         reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
-        if let Err(error) = self.quota_charge_file_to(&file, linkname.to_bytes().len() as u64) {
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
+        let _quota_guard = match self.quota_charge_file_to(&file, linkname.to_bytes().len() as u64)
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+        };
         if let Err(error) = file.write_all(linkname.to_bytes()).map_err(host_error) {
             let _ = std::fs::remove_file(&path);
             return Err(error);

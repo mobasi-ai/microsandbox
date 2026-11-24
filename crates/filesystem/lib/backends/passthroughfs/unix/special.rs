@@ -117,9 +117,11 @@ pub(crate) fn do_fallocate(
     // file. Charge the growth past EOF before allocating. Hole-punching frees
     // space, so it is never charged.
     const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
-    if mode & FALLOC_FL_PUNCH_HOLE == 0 {
-        fs.quota_charge_to(fd, offset.saturating_add(length))?;
-    }
+    let _quota_guard = if mode & FALLOC_FL_PUNCH_HOLE == 0 {
+        fs.quota_charge_to(fd, offset.saturating_add(length))?
+    } else {
+        None
+    };
 
     #[cfg(target_os = "linux")]
     {
@@ -257,7 +259,8 @@ pub(crate) fn do_copyfilerange(
         let f_out = data_out.file.read().unwrap();
 
         // Quota: the copy may grow the destination past EOF.
-        fs.quota_charge_to(f_out.as_raw_fd(), offset_out.saturating_add(len))?;
+        let _quota_guard =
+            fs.quota_charge_to(f_out.as_raw_fd(), offset_out.saturating_add(len))?;
 
         let mut off_in = offset_in as i64;
         let mut off_out = offset_out as i64;
