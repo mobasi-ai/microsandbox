@@ -3552,3 +3552,40 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
     .unwrap();
     assert!(seen.lock().unwrap().is_empty());
 }
+
+#[test]
+fn host_error_maps_win32_codes_and_rate_limits_eio_and_ebusy() {
+    assert_eq!(
+        host_error(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND)).raw_os_error(),
+        Some(LINUX_ENOENT)
+    );
+    assert_eq!(
+        host_error(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)).raw_os_error(),
+        Some(LINUX_EBUSY)
+    );
+    assert_eq!(
+        host_error(io::Error::from_raw_os_error(1392)).raw_os_error(),
+        Some(LINUX_EIO)
+    );
+
+    // Deterministic per-code rate limiter check (monotonic timestamps).
+    let mut limiter = ErrorRateLimiter::default();
+    assert_eq!(limiter.record(Some(1392), 100), Some(0));
+    assert_eq!(limiter.record(Some(1392), 200), None);
+    assert_eq!(limiter.record(Some(1392), 900), None);
+    // A distinct Win32 error code within the same second is NOT hidden by 1392.
+    assert_eq!(limiter.record(Some(ERROR_SHARING_VIOLATION), 250), Some(0));
+    assert_eq!(limiter.record(Some(ERROR_SHARING_VIOLATION), 500), None);
+    // After 1000 ms, 1392 logs again and reports 2 suppressed events.
+    assert_eq!(limiter.record(Some(1392), 1_100), Some(2));
+    // ErrorKind-only (no raw Win32 code) uses the `None` bucket independently.
+    assert_eq!(limiter.record(None, 300), Some(0));
+    assert_eq!(limiter.record(None, 400), None);
+
+    // Distinct numeric codes never grow the map beyond MAX_TRACKED_CODES (64).
+    let mut bounded = ErrorRateLimiter::default();
+    for code in 1..=100 {
+        let _ = bounded.record(Some(code), 100);
+    }
+    assert_eq!(bounded.buckets.len(), ErrorRateLimiter::MAX_TRACKED_CODES);
+}
