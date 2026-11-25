@@ -114,10 +114,12 @@ jobs:
 
       - name: Check agentd hash
         shell: pwsh
+        env:
+          EXPECTED_AGENTD_SHA256: ${{ needs.agentd.outputs.sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
           $hash = (Get-FileHash embed\agentd -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne "${{ needs.agentd.outputs.sha256 }}") { throw "agentd hash mismatch: $hash" }
+          if ($hash -ne $env:EXPECTED_AGENTD_SHA256) { throw "agentd hash mismatch: $hash" }
 
       - name: Build msb
         shell: pwsh
@@ -181,6 +183,7 @@ jobs:
     name: Package and release
     needs: [agentd, msb]
     runs-on: ubuntu-24.04
+    environment: mobasi-release
     permissions:
       contents: write
       id-token: write
