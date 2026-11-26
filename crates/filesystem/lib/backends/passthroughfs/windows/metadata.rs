@@ -127,9 +127,15 @@ impl PassthroughFs {
                     // Discard the unverified handle and re-open strictly relative to `self.root`.
                     drop(file);
                 }
-                Err(error) if error.raw_os_error() == Some(ERROR_PATH_NOT_FOUND) => {
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(ERROR_PATH_NOT_FOUND | ERROR_FILENAME_EXCED_RANGE)
+                    ) =>
+                {
                     // Fall through to handle-relative traversal so broken intermediate
-                    // reparse points report ELOOP rather than ENOENT.
+                    // reparse points report ELOOP rather than ENOENT and >260-char paths
+                    // without a verbatim `\\?\` prefix still resolve via `NtCreateFile`.
                 }
                 Err(error) => return Err(host_error(error)),
             }

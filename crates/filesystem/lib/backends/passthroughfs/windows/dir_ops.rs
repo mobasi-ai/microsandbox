@@ -224,7 +224,7 @@ impl PassthroughFs {
 
     /// Fallback enumeration on the SAME verified `dir_file` handle (never re-opening by
     /// pathname) for filesystems that do not support `FileIdBothDirectoryInfo`.
-    fn read_dir_entries_full_info(
+    pub(super) fn read_dir_entries_full_info(
         &self,
         dir_file: &File,
         dir_path: &Path,
@@ -315,7 +315,7 @@ impl PassthroughFs {
         }
     }
 
-    fn push_enumerated_child(
+    pub(super) fn push_enumerated_child(
         &self,
         dir_file: &File,
         dir_path: &Path,
@@ -343,7 +343,7 @@ impl PassthroughFs {
         validate_component(c_name)?;
 
         let child_path = dir_path.join(name_str);
-        if identity.is_none() {
+        if identity.is_none() && self.supports_hard_links {
             // Query identity relative to the already-verified `dir_file` handle.
             match nt_open_relative(dir_file, os_name, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, 0)
                 .and_then(|file| WinFileInfo::from_handle(&file))

@@ -158,6 +158,7 @@ const ERROR_FILE_EXISTS: i32 = 80;
 const ERROR_INVALID_NAME: i32 = 123;
 const ERROR_DIR_NOT_EMPTY: i32 = 145;
 const ERROR_ALREADY_EXISTS: i32 = 183;
+const ERROR_FILENAME_EXCED_RANGE: i32 = 206;
 const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
 
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
@@ -182,6 +183,12 @@ pub struct PassthroughFs {
     /// `root_handle` is pinned against deletion/rename so the fast-path exact UTF-16 prefix
     /// check cannot be invalidated by root replacement.
     root_nt_path: Option<Vec<u16>>,
+    /// Whether the backing volume advertises `FILE_SUPPORTS_HARD_LINKS` via
+    /// `GetVolumeInformationByHandleW` on `root_handle` at mount time (defaults to `true`
+    /// if the volume query fails). When `false` (for example scale-out SMB NAS shares or
+    /// FAT/exFAT volumes), directory enumeration skips per-child `nt_open_relative` identity
+    /// probes when `FileId` is absent.
+    supports_hard_links: bool,
     inodes: RwLock<InodeTable>,
     next_inode: AtomicU64,
     handles: RwLock<BTreeMap<u64, Arc<HandleData>>>,
@@ -542,6 +549,34 @@ fn open_root_anchor(root: &Path) -> io::Result<(File, Option<Vec<u16>>)> {
         None
     };
     Ok((file, root_nt_path))
+}
+
+/// Query whether the backing volume advertises `FILE_SUPPORTS_HARD_LINKS` via
+/// `GetVolumeInformationByHandleW`. Fails closed to `true` if the query fails so unknown
+/// filesystems retain the per-child identity probe.
+fn volume_supports_hard_links(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+    use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_HARD_LINKS;
+
+    let mut flags: u32 = 0;
+    // SAFETY: `file` owns a live handle; all optional output buffers are null with length 0.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return true;
+    }
+    (flags & FILE_SUPPORTS_HARD_LINKS) != 0
 }
 
 /// Re-open an existing verified kernel object handle with fresh access/share flags and an

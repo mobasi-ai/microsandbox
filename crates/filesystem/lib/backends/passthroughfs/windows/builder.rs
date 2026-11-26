@@ -183,11 +183,14 @@ impl PassthroughFs {
             )
         });
 
+        let supports_hard_links = volume_supports_hard_links(&root_handle);
+
         Ok(Self {
             cfg,
             root,
             root_handle,
             root_nt_path,
+            supports_hard_links,
             inodes: RwLock::new(InodeTable::default()),
             next_inode: AtomicU64::new(INIT_INODE + 1),
             handles: RwLock::new(BTreeMap::new()),

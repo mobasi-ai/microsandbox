@@ -4358,3 +4358,160 @@ fn host_error_maps_win32_codes_and_rate_limits_eio_and_ebusy() {
     }
     assert_eq!(bounded.buckets.len(), ErrorRateLimiter::MAX_TRACKED_CODES);
 }
+
+#[test]
+fn volume_without_hard_links_skips_per_child_identity_probe_on_missing_file_id() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("real.txt"), b"hello").unwrap();
+
+    let mut fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        stat_virtualization: StatVirtualization::Off,
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+    assert!(
+        fs.supports_hard_links,
+        "local NTFS temp volume should advertise FILE_SUPPORTS_HARD_LINKS"
+    );
+
+    let (dir_file, _) = fs
+        .open_verified_handle(
+            &fs.root,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            NT_FILE_DIRECTORY_FILE,
+        )
+        .unwrap();
+
+    // With hard-link support enabled, an absent FileId probes via `nt_open_relative`, so a
+    // synthetic name that is absent on disk returns ENOENT and is skipped.
+    let mut probed = Vec::new();
+    fs.push_enumerated_child(
+        &dir_file,
+        &fs.root,
+        std::ffi::OsStr::new("ghost-when-probed.txt"),
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+        &mut probed,
+    )
+    .unwrap();
+    assert!(probed.is_empty());
+
+    // Simulate a NAS/FAT volume whose volume flags lack FILE_SUPPORTS_HARD_LINKS.
+    fs.supports_hard_links = false;
+
+    // A missing FileId must NOT invoke `nt_open_relative`, so the synthetic entry is interned
+    // directly with a path-keyed inode (`identity: None`).
+    let mut unprobed = Vec::new();
+    fs.push_enumerated_child(
+        &dir_file,
+        &fs.root,
+        std::ffi::OsStr::new("no-probe-needed.txt"),
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+        &mut unprobed,
+    )
+    .unwrap();
+    assert_eq!(unprobed.len(), 1);
+    assert_eq!(unprobed[0].name, b"no-probe-needed.txt");
+    let interned = fs.inode(unprobed[0].inode).unwrap();
+    assert_eq!(interned.identity, None);
+
+    // Fallback `FileFullDirectoryInfo` enumeration on the real directory still returns `real.txt`
+    // cleanly without per-child probes.
+    let (dir_file_full, _) = fs
+        .open_verified_handle(
+            &fs.root,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            NT_FILE_DIRECTORY_FILE,
+        )
+        .unwrap();
+    let mut full_entries = Vec::new();
+    fs.read_dir_entries_full_info(&dir_file_full, &fs.root, &mut full_entries)
+        .unwrap();
+    assert_eq!(full_entries.len(), 1);
+    assert_eq!(full_entries[0].name, b"real.txt");
+}
+
+#[test]
+fn long_paths_over_max_path_resolve_enumerate_and_read() {
+    let temp = TempDir::new();
+    let canonical_root = std::fs::canonicalize(&temp.path).unwrap();
+
+    // Build a nested directory path exceeding the 260-char Win32 MAX_PATH boundary (~310 chars).
+    let seg = "nested_directory_segment_for_long_path_testing_0123456789";
+    let mut deep = canonical_root.clone();
+    for depth in 0..5 {
+        deep.push(format!("{seg}_{depth}"));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    let file_path = deep.join("deep_evidence_artifact_over_max_path.txt");
+    assert!(
+        file_path.as_os_str().len() > 290,
+        "expected >290-char path, got {}",
+        file_path.as_os_str().len()
+    );
+    std::fs::write(&file_path, b"long-path-payload").unwrap();
+
+    for no_symlink_root in [false, true] {
+        // Test with non-verbatim root path when `no_symlink_root` is true to exercise
+        // the `ERROR_FILENAME_EXCED_RANGE` / handle-relative fallback too.
+        let root_input = if no_symlink_root {
+            temp.path.clone()
+        } else {
+            canonical_root.clone()
+        };
+        let fs = PassthroughFs::new(PassthroughConfig {
+            root_dir: root_input,
+            no_symlink_root,
+            inject_init: false,
+            readonly: true,
+            stat_virtualization: StatVirtualization::Off,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let mut parent = ROOT_INODE;
+        for depth in 0..5 {
+            let name = std::ffi::CString::new(format!("{seg}_{depth}")).unwrap();
+            parent = fs.lookup(context(), parent, &name).unwrap().inode;
+        }
+        let (dir_fh, _) = fs
+            .opendir(context(), parent, LINUX_O_DIRECTORY as u32)
+            .unwrap();
+        let dir_entries = fs
+            .readdir(context(), parent, dir_fh.unwrap(), 4096, 0)
+            .unwrap();
+        assert!(
+            dir_entries
+                .iter()
+                .any(|e| e.name == b"deep_evidence_artifact_over_max_path.txt")
+        );
+        fs.releasedir(context(), parent, 0, dir_fh.unwrap()).unwrap();
+
+        let file_entry = fs
+            .lookup(context(), parent, c"deep_evidence_artifact_over_max_path.txt")
+            .unwrap();
+        let (fh, _) = fs.open(context(), file_entry.inode, false, 0).unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        fs.read(
+            context(),
+            file_entry.inode,
+            fh.unwrap(),
+            &mut writer,
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.bytes, b"long-path-payload");
+        fs.release(context(), file_entry.inode, 0, fh.unwrap(), false, false, None)
+            .unwrap();
+    }
+}
