@@ -4361,6 +4361,8 @@ fn host_error_maps_win32_codes_and_rate_limits_eio_and_ebusy() {
 
 #[test]
 fn volume_without_hard_links_skips_per_child_identity_probe_on_missing_file_id() {
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
     let temp = TempDir::new();
     std::fs::write(temp.path.join("real.txt"), b"hello").unwrap();
 
