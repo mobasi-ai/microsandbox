@@ -101,7 +101,7 @@ fn ensure_scripts_profile_block(profile: &str) -> String {
 //--------------------------------------------------------------------------------------------------
 
 mod linux {
-    use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+    use std::os::unix::fs::{self as unix_fs, MetadataExt, PermissionsExt};
     use std::path::Path;
     use std::{fs, thread, time::Duration};
 
@@ -118,6 +118,8 @@ mod linux {
     const UPPER_METRICS_PATH: &str = "/sys/kernel/msb_metrics/upper_path";
     const UPPER_METRICS_REGISTER_ATTEMPTS: usize = 100;
     const UPPER_METRICS_REGISTER_RETRY: Duration = Duration::from_millis(10);
+    const DEFAULT_VIRTIOFS_READAHEAD_KB: u64 = 1024;
+    const MAX_VIRTIOFS_READAHEAD_KB: u64 = 4096;
 
     //--------------------------------------------------------------------------------------------------
     // Types
@@ -706,7 +708,49 @@ mod linux {
             ))
         })?;
 
+        tune_virtiofs_readahead(path);
+
         Ok(())
+    }
+
+    /// Parse `MSB_VIRTIOFS_READAHEAD_KB`, returning `None` when tuning is disabled
+    /// (`0` / `off`) or `Some(kb)` clamped to `1..=MAX_VIRTIOFS_READAHEAD_KB`.
+    pub(super) fn parse_virtiofs_readahead_kb(raw: Option<&str>) -> Option<u64> {
+        let Some(raw) = raw else {
+            return Some(DEFAULT_VIRTIOFS_READAHEAD_KB);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Some(DEFAULT_VIRTIOFS_READAHEAD_KB);
+        }
+        if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("default") {
+            return None;
+        }
+        match trimmed.parse::<u64>() {
+            Ok(0) => None,
+            Ok(kb) => Some(kb.min(MAX_VIRTIOFS_READAHEAD_KB)),
+            Err(_) => Some(DEFAULT_VIRTIOFS_READAHEAD_KB),
+        }
+    }
+
+    /// Raise the Linux BDI readahead cap for a freshly mounted `virtiofs` filesystem so
+    /// sequential reads can scale up to `libkrun`'s 1 MiB `max_pages` (`256 * 4 KiB`) instead
+    /// of stalling at Linux's default 128 KiB (`VM_READAHEAD_PAGES`). Linux `ondemand_readahead`
+    /// keeps random 4 KiB `pread`s and initial 4 KiB header reads small and ramps to 1 MiB only
+    /// on sequential streams. Best-effort: never fails mount if sysfs BDI is absent.
+    fn tune_virtiofs_readahead(mount_path: &str) {
+        let env_val = std::env::var("MSB_VIRTIOFS_READAHEAD_KB").ok();
+        let Some(kb) = parse_virtiofs_readahead_kb(env_val.as_deref()) else {
+            return;
+        };
+        let Ok(meta) = fs::metadata(mount_path) else {
+            return;
+        };
+        let dev = meta.dev();
+        let major = libc::major(dev);
+        let minor = libc::minor(dev);
+        let bdi_path = format!("/sys/class/bdi/{major}:{minor}/read_ahead_kb");
+        let _ = fs::write(bdi_path, format!("{kb}\n"));
     }
 
     /// Mounts a single file from a virtiofs share via bind mount.
@@ -746,6 +790,8 @@ mod linux {
                 spec.tag
             ))
         })?;
+
+        tune_virtiofs_readahead(staging_path.as_str());
 
         let bind_result = (|| {
             // 3. Create parent directories for the guest path.
@@ -1189,5 +1235,23 @@ mod tests {
         let error = linux::planned_user_mounts_for_test(&dirs, &files, &[], &[]).unwrap_err();
 
         assert!(error.to_string().contains("file mount cannot contain"));
+    }
+
+    #[test]
+    fn test_parse_virtiofs_readahead_kb() {
+        assert_eq!(linux::parse_virtiofs_readahead_kb(None), Some(1024));
+        assert_eq!(linux::parse_virtiofs_readahead_kb(Some("")), Some(1024));
+        assert_eq!(linux::parse_virtiofs_readahead_kb(Some("0")), None);
+        assert_eq!(linux::parse_virtiofs_readahead_kb(Some("off")), None);
+        assert_eq!(linux::parse_virtiofs_readahead_kb(Some("DEFAULT")), None);
+        assert_eq!(linux::parse_virtiofs_readahead_kb(Some("256")), Some(256));
+        assert_eq!(
+            linux::parse_virtiofs_readahead_kb(Some("99999")),
+            Some(4096)
+        );
+        assert_eq!(
+            linux::parse_virtiofs_readahead_kb(Some("invalid")),
+            Some(1024)
+        );
     }
 }

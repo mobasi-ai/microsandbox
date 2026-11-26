@@ -74,3 +74,48 @@ publishes it as a release asset with its SHA-256 and `provenance.json`.
   fallback on the same handle), live handle-based `DirQuota` recounts
   with in-flight reservations, and open-handle `old_len` in `write`.
 - Drop when: merged upstream.
+
+### 6. microsandbox: detect volume hard-link support and skip per-child probes when FileId is absent
+
+- Branch: `mobasi/v0.8.1-r2`.
+- Why: Scale-out SMB NAS appliances without hard-link or FileId support
+  (`FILE_SUPPORTS_HARD_LINKS` clear, `FileId == 0`, or fallback to
+  `FileFullDirectoryInfo`) previously triggered one `nt_open_relative`
+  probe per directory entry during `READDIR`. Queries
+  `GetVolumeInformationByHandleW` once on `root_handle` at mount time
+  (failing closed to `true` on error) and skips the per-child identity
+  probe when the backing volume does not support hard links. Also routes
+  `ERROR_FILENAME_EXCED_RANGE` to the handle-relative `NtCreateFile`
+  walk so `>260`-character paths resolve cleanly even without a verbatim
+  `\\?\` root prefix.
+- Drop when: merged upstream.
+
+### 7. microsandbox: safe DO_READDIRPLUS on Windows read-only mounts with zero-open attributes
+
+- Branch: `mobasi/v0.8.1-r2`.
+- Why: Windows `PassthroughFs::init` previously returned
+  `FsOptions::empty()`, forcing the Linux guest to issue one
+  `FUSE_LOOKUP` (and one Windows `CreateFile` / SMB2 round-trip) per
+  entry after every `READDIR`. Negotiates `FsOptions::DO_READDIRPLUS` by
+  default on read-only mounts with `StatVirtualization::Off`
+  (`MSB_WIN_READDIRPLUS=auto|on|off`), populates `DirSnapshotEntry` with
+  the `WinFileInfo` already returned by `FILE_ID_BOTH_DIR_INFO` /
+  `FILE_FULL_DIR_INFO` so `readdirplus_for_each` performs zero per-child
+  host opens, and detects stale directory-entry sizes in `do_open` by
+  comparing against live handle `WinFileInfo::file_size` (returning
+  `FOPEN_DIRECT_IO` on a mismatch so Linux FUSE never truncates reads to
+  a stale `i_size`).
+- Drop when: merged upstream.
+
+### 8. agentd: raise virtiofs BDI read_ahead_kb to 1024 KiB
+
+- Branch: `mobasi/v0.8.1-r2`.
+- Why: `libkrun` already negotiates `max_pages = 256` (`1 MiB`), but the
+  Linux guest defaults every `virtiofs` mount's BDI `read_ahead_kb` to
+  `128 KiB`, capping buffered sequential `FUSE_READ` requests at 128 KiB.
+  Sets `/sys/class/bdi/<major>:<minor>/read_ahead_kb` to `1024` (or
+  `MSB_VIRTIOFS_READAHEAD_KB`, `0`/`off` to disable) right after mounting
+  each `virtiofs` share. Linux's adaptive `ondemand_readahead` keeps
+  random 4 KiB `pread`s and initial 4 KiB header reads small while
+  scaling sequential streams to 1 MiB chunks.
+- Drop when: merged upstream.
