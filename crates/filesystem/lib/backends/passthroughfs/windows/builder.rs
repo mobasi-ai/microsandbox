@@ -184,6 +184,7 @@ impl PassthroughFs {
         });
 
         let supports_hard_links = volume_supports_hard_links(&root_handle);
+        let readdirplus_mode = ReaddirplusMode::from_env();
 
         Ok(Self {
             cfg,
@@ -191,6 +192,7 @@ impl PassthroughFs {
             root_handle,
             root_nt_path,
             supports_hard_links,
+            readdirplus_mode,
             inodes: RwLock::new(InodeTable::default()),
             next_inode: AtomicU64::new(INIT_INODE + 1),
             handles: RwLock::new(BTreeMap::new()),

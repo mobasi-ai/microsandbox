@@ -159,13 +159,19 @@ impl PassthroughFs {
         handle: Option<u64>,
     ) -> io::Result<WinFileInfo> {
         if let Some(file) = data.retained.lock().unwrap().as_ref() {
-            return WinFileInfo::from_handle(file);
+            let info = WinFileInfo::from_handle(file)?;
+            data.readdirplus_size
+                .store(NO_READDIRPLUS_SIZE, Ordering::Release);
+            return Ok(info);
         }
         if let Some(fh) = handle
             && let Ok(open_handle) = self.handle(data.inode, fh)
         {
             let file = open_handle.file.lock().unwrap();
-            return WinFileInfo::from_handle(&file);
+            let info = WinFileInfo::from_handle(&file)?;
+            data.readdirplus_size
+                .store(NO_READDIRPLUS_SIZE, Ordering::Release);
+            return Ok(info);
         }
         let info = self.open_verified_file_info(&data.path())?;
         if let (Some(expected), Some(actual)) = (data.identity, info.identity)
@@ -173,6 +179,8 @@ impl PassthroughFs {
         {
             return Err(linux_error(LINUX_ESTALE));
         }
+        data.readdirplus_size
+            .store(NO_READDIRPLUS_SIZE, Ordering::Release);
         Ok(info)
     }
 

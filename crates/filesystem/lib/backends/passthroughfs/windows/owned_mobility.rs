@@ -245,6 +245,7 @@ pub(super) fn prepare(fs: &PassthroughFs, bytes: &[u8]) -> io::Result<PreparedSt
             retained: Mutex::new(temporary.then_some(pinned)),
             retained_stat: Mutex::new(if temporary { stat_file } else { None }),
             lookups: AtomicU64::new(0),
+            readdirplus_size: AtomicU64::new(super::super::NO_READDIRPLUS_SIZE),
         });
         if let Some(identity) = data.identity
             && prepared

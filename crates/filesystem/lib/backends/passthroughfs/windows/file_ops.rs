@@ -25,7 +25,22 @@ impl PassthroughFs {
         // Atomically re-open either the pinned retained handle (without releasing the
         // retained lock across a fallback) or a verified non-truncating handle under root,
         // then acquire the DAX lock on THAT exact handle before truncating.
-        let (file, _info) = self.open_verified_inode_file(&data, flags)?;
+        let (file, info) = self.open_verified_inode_file(&data, flags)?;
+        let cached_size = data
+            .readdirplus_size
+            .swap(NO_READDIRPLUS_SIZE, Ordering::AcqRel);
+        let open_options = if cached_size != NO_READDIRPLUS_SIZE
+            && cached_size != info.file_size
+            && flags & LINUX_O_TRUNC as u32 == 0
+        {
+            // Directory enumeration (`FILE_ID_BOTH_DIR_INFO` / `FILE_FULL_DIR_INFO`) can
+            // lag behind the live MFT size for files with an open host writer or hard-link
+            // update. Returning `FOPEN_DIRECT_IO` on this open bypasses stale `i_size`
+            // clamping in Linux FUSE so guest `read()` sees all live bytes.
+            OpenOptions::DIRECT_IO
+        } else {
+            OpenOptions::empty()
+        };
         if flags & LINUX_O_TRUNC as u32 != 0 {
             let state = self.dax_files.get(&file)?;
             self.with_file_mappings_suspended(&state, || file.set_len(0).map_err(host_error))?;
@@ -43,7 +58,7 @@ impl PassthroughFs {
                 dirty: AtomicBool::new(flags & LINUX_O_TRUNC as u32 != 0),
             }),
         );
-        Ok((Some(handle), OpenOptions::empty()))
+        Ok((Some(handle), open_options))
     }
 
     /// Atomically re-open an inode's pinned retained handle while holding `data.retained`.

@@ -26,6 +26,10 @@ pub(super) struct InodeData {
     pub(super) retained_stat: Mutex<Option<File>>,
     /// Guest lookup references, used for owned detached-object reclamation.
     pub(super) lookups: AtomicU64,
+    /// Last regular-file size served from a batched directory-enumeration entry
+    /// (`FILE_ID_BOTH_DIR_INFO` / `FILE_FULL_DIR_INFO`) via `READDIRPLUS`, or
+    /// `NO_READDIRPLUS_SIZE` once refreshed from a live handle query.
+    pub(super) readdirplus_size: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -57,6 +61,7 @@ pub(super) struct DirSnapshotEntry {
     pub(super) name: Vec<u8>,
     pub(super) offset: u64,
     pub(super) file_type: u32,
+    pub(super) info: Option<WinFileInfo>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -163,6 +168,7 @@ impl PassthroughFs {
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
             lookups: AtomicU64::new(0),
+            readdirplus_size: AtomicU64::new(NO_READDIRPLUS_SIZE),
         });
 
         let mut inodes = self.inodes.write().unwrap();
@@ -240,6 +246,7 @@ impl PassthroughFs {
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
             lookups: AtomicU64::new(0),
+            readdirplus_size: AtomicU64::new(NO_READDIRPLUS_SIZE),
         });
         inodes.by_inode.insert(inode, data.clone());
         inodes.by_path.insert(path, data.clone());
@@ -345,6 +352,8 @@ impl PassthroughFs {
     pub(super) fn entry_for_path(&self, path: PathBuf) -> io::Result<Entry> {
         let info = self.open_verified_file_info(&path)?;
         let data = self.intern_path_with_identity(path, info.identity)?;
+        data.readdirplus_size
+            .store(NO_READDIRPLUS_SIZE, Ordering::Release);
         self.entry_from_file_info(&info, data.as_ref())
     }
 

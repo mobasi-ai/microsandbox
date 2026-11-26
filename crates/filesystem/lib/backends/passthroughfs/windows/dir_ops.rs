@@ -51,6 +51,16 @@ impl PassthroughFs {
             return Ok(init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout));
         }
         let data = self.inode(entry.inode)?;
+        if !self.cfg.stat_virtualization_enabled()
+            && data.retained.lock().unwrap().is_none()
+            && let Some(info) = entry.info
+        {
+            if !info.is_dir() {
+                data.readdirplus_size
+                    .store(info.file_size, Ordering::Release);
+            }
+            return self.entry_from_file_info(&info, data.as_ref());
+        }
         let info = self.inode_file_info(&data, None)?;
         self.entry_from_file_info(&info, data.as_ref())
     }
@@ -85,12 +95,14 @@ impl PassthroughFs {
             name: b".".to_vec(),
             offset: 1,
             file_type: DT_DIR,
+            info: Some(dir_info),
         });
         entries.push(DirSnapshotEntry {
             inode: parent_inode,
             name: b"..".to_vec(),
             offset: 2,
             file_type: DT_DIR,
+            info: (inode == ROOT_INODE).then_some(dir_info),
         });
 
         if self.cfg.inject_init && inode == ROOT_INODE {
@@ -99,6 +111,7 @@ impl PassthroughFs {
                 name: INIT_NAME.to_vec(),
                 offset: entries.len() as u64 + 1,
                 file_type: DT_REG,
+                info: None,
             });
         }
 
@@ -205,14 +218,15 @@ impl PassthroughFs {
                     )
                 };
                 let os_name = OsString::from_wide(name_units);
-                self.push_enumerated_child(
-                    dir_file,
-                    dir_path,
-                    &os_name,
+                let entry_info = WinFileInfo::from_dir_entry(
                     info.FileAttributes,
+                    info.CreationTime,
+                    info.LastAccessTime,
+                    info.LastWriteTime,
+                    info.EndOfFile,
                     valid_file_identity(volume_serial, info.FileId as u64),
-                    entries,
-                )?;
+                );
+                self.push_enumerated_child(dir_file, dir_path, &os_name, entry_info, entries)?;
 
                 if info.NextEntryOffset == 0 {
                     break;
@@ -298,14 +312,15 @@ impl PassthroughFs {
                     )
                 };
                 let os_name = OsString::from_wide(name_units);
-                self.push_enumerated_child(
-                    dir_file,
-                    dir_path,
-                    &os_name,
+                let entry_info = WinFileInfo::from_dir_entry(
                     info.FileAttributes,
+                    info.CreationTime,
+                    info.LastAccessTime,
+                    info.LastWriteTime,
+                    info.EndOfFile,
                     None,
-                    entries,
-                )?;
+                );
+                self.push_enumerated_child(dir_file, dir_path, &os_name, entry_info, entries)?;
 
                 if info.NextEntryOffset == 0 {
                     break;
@@ -320,8 +335,7 @@ impl PassthroughFs {
         dir_file: &File,
         dir_path: &Path,
         os_name: &std::ffi::OsStr,
-        file_attributes: u32,
-        mut identity: Option<(u32, u64)>,
+        mut entry_info: WinFileInfo,
         entries: &mut Vec<DirSnapshotEntry>,
     ) -> io::Result<()> {
         let Some(name_str) = os_name.to_str() else {
@@ -333,7 +347,7 @@ impl PassthroughFs {
             || name_str == ".."
             || is_reserved_name(name_str)
             || is_windows_device_name(name_str)
-            || file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || entry_info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         {
             return Ok(());
         }
@@ -343,12 +357,12 @@ impl PassthroughFs {
         validate_component(c_name)?;
 
         let child_path = dir_path.join(name_str);
-        if identity.is_none() && self.supports_hard_links {
+        if entry_info.identity.is_none() && self.supports_hard_links {
             // Query identity relative to the already-verified `dir_file` handle.
             match nt_open_relative(dir_file, os_name, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, 0)
                 .and_then(|file| WinFileInfo::from_handle(&file))
             {
-                Ok(verified) => identity = verified.identity,
+                Ok(verified) => entry_info = verified,
                 Err(error)
                     if matches!(error.raw_os_error(), Some(LINUX_ELOOP | LINUX_ENOENT)) =>
                 {
@@ -358,12 +372,12 @@ impl PassthroughFs {
             }
         }
 
-        let child = self.intern_path_with_identity(child_path, identity)?;
+        let child = self.intern_path_with_identity(child_path, entry_info.identity)?;
         let file_type = if self.cfg.stat_virtualization_enabled() {
             let info = self.inode_file_info(&child, None)?;
             let st = self.stat_from_file_info(&info, child.as_ref())?;
             dirent_type_from_mode(st.st_mode)
-        } else if file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        } else if entry_info.is_dir() {
             DT_DIR
         } else {
             DT_REG
@@ -374,6 +388,7 @@ impl PassthroughFs {
             name: c_name.to_bytes().to_vec(),
             offset: entries.len() as u64 + 1,
             file_type,
+            info: Some(entry_info),
         });
         Ok(())
     }

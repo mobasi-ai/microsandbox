@@ -4388,13 +4388,13 @@ fn volume_without_hard_links_skips_per_child_identity_probe_on_missing_file_id()
 
     // With hard-link support enabled, an absent FileId probes via `nt_open_relative`, so a
     // synthetic name that is absent on disk returns ENOENT and is skipped.
+    let synthetic_info = WinFileInfo::from_dir_entry(FILE_ATTRIBUTE_NORMAL, 0, 0, 0, 0, None);
     let mut probed = Vec::new();
     fs.push_enumerated_child(
         &dir_file,
         &fs.root,
         std::ffi::OsStr::new("ghost-when-probed.txt"),
-        FILE_ATTRIBUTE_NORMAL,
-        None,
+        synthetic_info,
         &mut probed,
     )
     .unwrap();
@@ -4410,8 +4410,7 @@ fn volume_without_hard_links_skips_per_child_identity_probe_on_missing_file_id()
         &dir_file,
         &fs.root,
         std::ffi::OsStr::new("no-probe-needed.txt"),
-        FILE_ATTRIBUTE_NORMAL,
-        None,
+        synthetic_info,
         &mut unprobed,
     )
     .unwrap();
@@ -4514,4 +4513,174 @@ fn long_paths_over_max_path_resolve_enumerate_and_read() {
         fs.release(context(), file_entry.inode, 0, fh.unwrap(), false, false, None)
             .unwrap();
     }
+}
+
+#[test]
+fn init_negotiates_readdirplus_only_when_allowed_by_mode_and_config() {
+    let temp = TempDir::new();
+    let caps = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
+
+    assert_eq!(ReaddirplusMode::parse("on"), ReaddirplusMode::On);
+    assert_eq!(ReaddirplusMode::parse("1"), ReaddirplusMode::On);
+    assert_eq!(ReaddirplusMode::parse("TRUE"), ReaddirplusMode::On);
+    assert_eq!(ReaddirplusMode::parse("off"), ReaddirplusMode::Off);
+    assert_eq!(ReaddirplusMode::parse("0"), ReaddirplusMode::Off);
+    assert_eq!(ReaddirplusMode::parse("false"), ReaddirplusMode::Off);
+    assert_eq!(ReaddirplusMode::parse("auto"), ReaddirplusMode::Auto);
+    assert_eq!(ReaddirplusMode::parse("unknown"), ReaddirplusMode::Auto);
+
+    // Auto + readonly + stat_virtualization Off => DO_READDIRPLUS enabled (without READDIRPLUS_AUTO).
+    let mut ro_off = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        readonly: true,
+        stat_virtualization: StatVirtualization::Off,
+        ..Default::default()
+    })
+    .unwrap();
+    ro_off.readdirplus_mode = ReaddirplusMode::Auto;
+    let opts = ro_off.init(caps).unwrap();
+    assert!(opts.contains(FsOptions::DO_READDIRPLUS));
+    assert!(!opts.contains(FsOptions::READDIRPLUS_AUTO));
+    assert_eq!(ro_off.init(FsOptions::empty()).unwrap(), FsOptions::empty());
+
+    // Auto + Off kill-switch => disabled.
+    ro_off.readdirplus_mode = ReaddirplusMode::Off;
+    assert!(!ro_off.init(caps).unwrap().contains(FsOptions::DO_READDIRPLUS));
+
+    // Auto + writable => disabled; explicit On => enabled.
+    let mut rw_off = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        readonly: false,
+        stat_virtualization: StatVirtualization::Off,
+        ..Default::default()
+    })
+    .unwrap();
+    rw_off.readdirplus_mode = ReaddirplusMode::Auto;
+    assert!(!rw_off.init(caps).unwrap().contains(FsOptions::DO_READDIRPLUS));
+    rw_off.readdirplus_mode = ReaddirplusMode::On;
+    assert!(rw_off.init(caps).unwrap().contains(FsOptions::DO_READDIRPLUS));
+
+    // Auto + readonly + Strict stat virtualization => disabled.
+    let mut ro_strict = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        readonly: true,
+        stat_virtualization: StatVirtualization::Strict,
+        ..Default::default()
+    })
+    .unwrap();
+    ro_strict.readdirplus_mode = ReaddirplusMode::Auto;
+    assert!(!ro_strict.init(caps).unwrap().contains(FsOptions::DO_READDIRPLUS));
+}
+
+#[test]
+fn readdirplus_uses_cached_dir_entry_info_and_detects_stale_size_on_open() {
+    let temp = TempDir::new();
+    let growing = temp.path.join("growing.bin");
+    let steady = temp.path.join("steady.bin");
+    std::fs::write(&growing, b"initial-10").unwrap();
+    std::fs::write(&steady, b"unchanged").unwrap();
+
+    // Keep an open host write handle on `growing.bin` while appending so NTFS directory
+    // metadata can lag behind the live MFT file size.
+    let mut host_writer = StdOpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(&growing)
+        .unwrap();
+
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        readonly: true,
+        stat_virtualization: StatVirtualization::Off,
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::DO_READDIRPLUS).unwrap();
+
+    // Enumerate via readdirplus before the host append.
+    let (dh, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let entries = fs
+        .readdirplus(context(), ROOT_INODE, dh.unwrap(), 4096, 0)
+        .unwrap();
+    fs.releasedir(context(), ROOT_INODE, 0, dh.unwrap()).unwrap();
+
+    let (_, steady_entry) = entries
+        .iter()
+        .find(|(de, _)| de.name == b"steady.bin")
+        .unwrap();
+    let (_, growing_entry) = entries
+        .iter()
+        .find(|(de, _)| de.name == b"growing.bin")
+        .unwrap();
+    assert_eq!(steady_entry.attr.st_size, 9);
+    assert_eq!(growing_entry.attr.st_size, 10);
+
+    // Unchanged file opens with normal page-cache options (not DIRECT_IO).
+    let (steady_fh, steady_opts) = fs.open(context(), steady_entry.inode, false, 0).unwrap();
+    assert!(!steady_opts.contains(OpenOptions::DIRECT_IO));
+    fs.release(
+        context(),
+        steady_entry.inode,
+        0,
+        steady_fh.unwrap(),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+
+    // Append bytes via the still-open host writer, then open the file via FUSE.
+    host_writer.write_all(b"-plus-more-bytes").unwrap();
+    host_writer.flush().unwrap();
+
+    let (growing_fh, growing_opts) = fs.open(context(), growing_entry.inode, false, 0).unwrap();
+    assert!(
+        growing_opts.contains(OpenOptions::DIRECT_IO),
+        "stale directory-entry size must trigger FOPEN_DIRECT_IO so Linux FUSE does not truncate"
+    );
+    let mut writer = CaptureWriter { bytes: Vec::new() };
+    fs.read(
+        context(),
+        growing_entry.inode,
+        growing_fh.unwrap(),
+        &mut writer,
+        64,
+        0,
+        None,
+        0,
+    )
+    .unwrap();
+    assert_eq!(writer.bytes, b"initial-10-plus-more-bytes");
+    fs.release(
+        context(),
+        growing_entry.inode,
+        0,
+        growing_fh.unwrap(),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+
+    // After open/getattr refreshes the inode, a subsequent open returns normal cached options.
+    let (live_stat, _) = fs.getattr(context(), growing_entry.inode, None).unwrap();
+    assert_eq!(live_stat.st_size, 26);
+    let (fh2, opts2) = fs.open(context(), growing_entry.inode, false, 0).unwrap();
+    assert!(!opts2.contains(OpenOptions::DIRECT_IO));
+    fs.release(
+        context(),
+        growing_entry.inode,
+        0,
+        fh2.unwrap(),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
 }

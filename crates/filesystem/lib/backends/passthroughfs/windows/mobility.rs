@@ -891,6 +891,7 @@ fn rebuild(
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
             lookups: std::sync::atomic::AtomicU64::new(0),
+            readdirplus_size: std::sync::atomic::AtomicU64::new(super::NO_READDIRPLUS_SIZE),
         });
         if let Some(identity) = data.identity {
             // Older external snapshots assigned separate inode IDs to hardlinks.
@@ -955,6 +956,7 @@ fn rebuild(
                         name: entry.name.clone(),
                         offset: entry.offset,
                         file_type: entry.file_type,
+                        info: None,
                     })
                     .collect(),
             )

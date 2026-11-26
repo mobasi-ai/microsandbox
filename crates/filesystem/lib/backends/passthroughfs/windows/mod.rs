@@ -148,6 +148,7 @@ const NT_FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
 const NT_FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const NT_OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 const FILE_INVALID_FILE_ID: u64 = u64::MAX;
+const NO_READDIRPLUS_SIZE: u64 = u64::MAX;
 
 const ERROR_FILE_NOT_FOUND: i32 = 2;
 const ERROR_PATH_NOT_FOUND: i32 = 3;
@@ -189,6 +190,8 @@ pub struct PassthroughFs {
     /// FAT/exFAT volumes), directory enumeration skips per-child `nt_open_relative` identity
     /// probes when `FileId` is absent.
     supports_hard_links: bool,
+    /// Policy for negotiating `FsOptions::DO_READDIRPLUS`, configured via `MSB_WIN_READDIRPLUS`.
+    readdirplus_mode: ReaddirplusMode,
     inodes: RwLock<InodeTable>,
     next_inode: AtomicU64,
     handles: RwLock<BTreeMap<u64, Arc<HandleData>>>,
@@ -202,6 +205,30 @@ pub struct PassthroughFs {
     map_windows: Mutex<DaxWindows>,
     /// Host-file coordination shared by hardlink aliases, separate from worker waits.
     dax_files: DaxFiles,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReaddirplusMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl ReaddirplusMode {
+    pub(super) fn from_env() -> Self {
+        match std::env::var("MSB_WIN_READDIRPLUS") {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => Self::Auto,
+        }
+    }
+
+    pub(super) fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on" | "1" | "true" => Self::On,
+            "off" | "0" | "false" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -234,6 +261,14 @@ enum StatStoreBackend {
 impl PassthroughFs {
     pub(crate) fn max_state_bytes(&self) -> usize {
         self.cfg.max_state_bytes
+    }
+
+    pub(super) fn readdirplus_enabled(&self) -> bool {
+        match self.readdirplus_mode {
+            ReaddirplusMode::Auto => self.cfg.readonly && !self.cfg.stat_virtualization_enabled(),
+            ReaddirplusMode::On => true,
+            ReaddirplusMode::Off => false,
+        }
     }
 
     /// Validate an external checkpoint without opening any destination host paths.
@@ -388,6 +423,30 @@ impl WinFileInfo {
             nlink: u64::from(info.nNumberOfLinks),
             identity: valid_file_identity(info.dwVolumeSerialNumber, file_index),
         })
+    }
+
+    pub(super) fn from_dir_entry(
+        file_attributes: u32,
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        end_of_file: i64,
+        identity: Option<(u32, u64)>,
+    ) -> Self {
+        let is_dir = file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        Self {
+            file_attributes,
+            creation_time: u64::try_from(creation_time).unwrap_or(0),
+            last_access_time: u64::try_from(last_access_time).unwrap_or(0),
+            last_write_time: u64::try_from(last_write_time).unwrap_or(0),
+            file_size: if is_dir {
+                0
+            } else {
+                u64::try_from(end_of_file).unwrap_or(0)
+            },
+            nlink: 1,
+            identity,
+        }
     }
 
     pub(super) fn is_dir(&self) -> bool {

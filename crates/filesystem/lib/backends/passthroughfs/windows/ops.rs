@@ -29,9 +29,13 @@ impl DynFileSystem for PassthroughFs {
         mobility::restore(self, state)
     }
 
-    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         self.insert_root()?;
-        Ok(FsOptions::empty())
+        let mut opts = FsOptions::empty();
+        if self.readdirplus_enabled() && capable.contains(FsOptions::DO_READDIRPLUS) {
+            opts |= FsOptions::DO_READDIRPLUS;
+        }
+        Ok(opts)
     }
 
     fn destroy(&self) {
