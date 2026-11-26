@@ -4588,7 +4588,6 @@ fn readdirplus_uses_cached_dir_entry_info_and_detects_stale_size_on_open() {
     // Keep an open host write handle on `growing.bin` while appending so NTFS directory
     // metadata can lag behind the live MFT file size.
     let mut host_writer = StdOpenOptions::new()
-        .write(true)
         .append(true)
         .open(&growing)
         .unwrap();
